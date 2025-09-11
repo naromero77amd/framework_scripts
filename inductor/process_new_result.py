@@ -69,8 +69,7 @@ def process_csv(csv1, csv2, threshold=100, output="test.csv"):
 
     # ---------- Compute totals ----------
     if not merged.empty:
-        merged["total_latency"] = merged["count_mi350x"] * merged["avg_latency_mi350x"]
-        total_sum_latency = merged["total_latency"].sum()
+        total_sum_latency = filtered["sum_latency_mi350x"].sum() / 1000.0
 
         merged["total_ms"] = merged["count_mi350x"] * merged["ms_per_call"]
         total_sum_ms = merged["total_ms"].sum()
@@ -106,4 +105,5 @@ def process_csv(csv1, csv2, threshold=100, output="test.csv"):
 
 # Example usage
 if __name__ == "__main__":
-    result_df, total_latency, total_ms, pattern_sums, unmatched_count = process_csv("model2-b200-mi350x-poiautotune-0828.csv", "kernels-cache-0828_autotune_poi/triton_results_20250909_rocm7rc1_autotune_pointwise.csv", threshold=1.0)
+    result_df, total_latency, total_ms, pattern_sums, unmatched_count = process_csv("model2-b200-mi350x-poiautotune-0828.csv", "meta_data.csv", threshold=1.0)
+    # result_df, total_latency, total_ms, pattern_sums, unmatched_count = process_csv("model2-b200-mi350x-poiautotune-0828.csv", "kernels-cache-0828_autotune_poi/triton_results_20250910_rocm7rc1_autotune_pointwise.csv", threshold=1.0)
