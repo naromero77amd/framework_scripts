@@ -37,8 +37,23 @@ find "$BASE_DIR" -type f -name '*.py.launch_params' -exec rm -f {} +
 CSV_FILE="$BASE_DIR/triton_results_$(date +%Y%m%d_%H%M%S).csv"
 echo "relative_dir,kernel_name,ms_per_call,gb_per_s" > "$CSV_FILE"
 
-# --- Find and run triton_*_<integer>.py files ---
-find "$BASE_DIR" -type f -regextype posix-extended -regex '.*/triton_.*_[0-9]+\.py' | while read -r file; do
+# --- Collect all matching files, sort by "family" ---
+FILES=$(find "$BASE_DIR" -type f -regextype posix-extended \
+    -regex '.*/triton_.*_[0-9]+(_[A-Za-z0-9]+)?\.py' |
+    awk -F/ '{print $0"\t"$NF}' |
+    awk -F'\t' '{
+        fname=$2
+        base=fname
+        sub(/\.py$/,"",base)
+        sub(/_[A-Za-z0-9]+$/,"",base)   # remove optional _sha
+        print base"\t"$1
+    }' |
+    sort -k1,1 -k2,2 |
+    cut -f2)
+
+# --- Run files in the desired order ---
+echo "$FILES" | while read -r file; do
+    [[ -z "$file" ]] && continue
     echo "Running $file ..."
 
     # Relative directory from BASE_DIR
