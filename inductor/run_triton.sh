@@ -56,6 +56,14 @@ echo "$FILES" | while read -r file; do
     [[ -z "$file" ]] && continue
     echo "Running $file ..."
 
+    # Cleanup before each Python invocation
+    if [[ -d "/tmp/torchinductor_root" ]]; then
+        rm -rf /tmp/torchinductor_root
+    fi
+
+    # Delete all *.best_config files
+    find "$BASE_DIR" -type f -name '*.best_config' -exec rm -f {} +
+
     # Relative directory from BASE_DIR
     rel_dir=$(dirname "${file#$BASE_DIR/}")
 
