@@ -3,6 +3,7 @@
 # environment variables
 export AMDGCN_USE_BUFFER_OPS=1
 export TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
+export CUDA_VISIBLE_DEVICES=7
 
 # Usage: ./run_triton.sh <kernels directory>
 BASE_DIR="$1"
