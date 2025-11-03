@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import sys
 
@@ -13,7 +14,7 @@ def main(ref_csv, opt_csv, output_csv):
     ]
 
     # Merge only on valid reference names (inner join)
-    merged = pd.merge(ref_df, opt_df, on='Name', suffixes=('_ref', '_opt'))
+    merged = pd.merge(ref_df, opt_df, on='name', suffixes=('_ref', '_opt'))
 
     # Compute ratios
     merged['abs_latency_ratio'] = merged['abs_latency_ref'] / merged['abs_latency_opt']
@@ -22,11 +23,15 @@ def main(ref_csv, opt_csv, output_csv):
     )
 
     # Select only required columns
-    result = merged[['Name', 'abs_latency_ratio', 'compilation_latency_ratio']]
+    result = merged[['name', 'abs_latency_ratio', 'compilation_latency_ratio']]
 
     # Save to output CSV
     result.to_csv(output_csv, index=False)
     print(f"Saved output to {output_csv}")
+
+
+    geo_mean = np.exp(np.log(result['abs_latency_ratio']).mean())
+    print(geo_mean)
 
 if __name__ == "__main__":
     if len(sys.argv) != 4:
