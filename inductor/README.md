@@ -39,33 +39,40 @@ index 64518ce..b816218 100644
 
    There is a script in `inductor/modify_inductor_bench.sh` that will modify that line in all kernels that are recursively found in a subdirectory.
 
-8. Run the kernels using the script `inductor/run_triton.sh <dir>`.
+8. Run the kernels using the script `inductor/run_triton_new.sh <dir>`. There is also a `inductor/run_triton.sh` script which is nearly indentical
+   except that it doesn't contain the full path to the Inductor-Triton kernel file.
 
-   This script is very similar to the behavior of:
+   This script is very similar to:
    `paas-inductor --dir=./organized --run-types=autotune`
 
    There are two main differences:
-   1. `run_triton.sh` script is serial, there is no --distributed option. This was done for simplicity mostly.
-   2.  Inductor kernel naming scheme is complex and in general can change with any code changes. This can occur between different architectures (ROCm vs. CUDA) and even on single architecture when a PR is applied.
-       `run_triton.sh` will create a CSV file similar to `paas-inductor` but the kernel name will have the filename with two extra concataned strings.
+   1. `run_triton[_new].sh` script is serial, there is no --distributed option. This was done for simplicity mostly.
+   2. There is a RegEx expression in the script that you will need to modify depending on whether or not you want to run a subset of the Triton kernels.
 
-       For example, the kernel in `triton_per_fused_add_native_layer_norm_backward_select_16.py`
-       will have an entry in the CSV file that looks something like:
+      Look for:
+      `-regex '.*/triton_per_.*_[0-9]+(_[A-Za-z0-9]+)?.py`
+      and modify according to your needs.
 
-       persistent_reduction,meta_pr/hf_with_per_pr/kernels-hf/persistent_reduction/triton_per_fused_add_native_layer_norm_backward_select_16.py,triton_per_fused_add_native_layer_norm_backward_select_16_x8192_r6,0.006,36.07
+   3. Inductor kernel naming scheme is complex and in general can change with any code changes. This can occur between different architectures (ROCm vs. CUDA) and even on single architecture when a PR is applied.
+      `run_triton_new.sh` will create a CSV file similar to `paas-inductor` but the kernel name will have the filename with two extra concataned strings.
 
-       where the kernel name has the basefilename with an extra string, "x<numel>_r<r0_numel>"
+      For example, the kernel in `triton_per_fused_add_native_layer_norm_backward_select_16.py`
+      will have an entry in the CSV file that looks something like:
 
-       This will help distinguish kernels with different dynamic shapes.
+      persistent_reduction,meta_pr/hf_with_per_pr/kernels-hf/persistent_reduction/triton_per_fused_add_native_layer_norm_backward_select_16.py,triton_per_fused_add_native_layer_norm_backward_select_16_x8192_r6,0.006,36.07
 
-       NOTE: This script is not general enough to work in some cases:
-       For example, the first integer after the kernel name, `_16` in this example, may not necessary be the same when comparing very different Inductor caches.
+      where the kernel name has the basefilename with an extra string, "x<numel>_r<r0_numel>". Yo
 
-       In spite of these limitations, this script seems to be sufficient for the use case of a single architecture with and without the PR change.
+      This will help distinguish kernels with different dynamic shapes.
 
-       For 2D or 3D kernels, it is possible that we would need to add additional string to distinguish the kernel. For example, for a 2D string "y<numel>_r<r1_numel>".
+      NOTE: This script is not general enough to work in some cases:
+      For example, the first integer after the kernel name, `_16` in this example, may not necessary be the same when comparing very different Inductor caches.
 
-       A more robust solution would be to compare the entire kernel body.
+      In spite of these limitations, this script seems to be sufficient for the use case of a single architecture with and without the PR change.
+
+      For 2D or 3D kernels, it is possible that we would need to add additional string to distinguish the kernel. For example, for a 2D string "y<numel>_r<r1_numel>".
+
+      A more robust solution would be to compare the entire kernel body.
 
 9. Repeat Steps. 4 - 8. for the baseline branch with the PR applied.
 
