@@ -1,6 +1,8 @@
 #!/usr/bin/bash 
-pip uninstall pytorch-triton-rocm
-pip uninstall triton -y
+# NOTE: Always confirm that Triton is properly installed
+#       by doing: pip show triton
+pip uninstall -y pytorch-triton-rocm
+pip uninstall -y triton
 pip install -r python/requirements.txt
-# pip install -e . # triton 3.4 and later
-pip install -e python # triton 3.3
+pip install . # triton 3.4 and later
+# pip install python # triton 3.3
