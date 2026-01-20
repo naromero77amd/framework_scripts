@@ -20,7 +20,7 @@ def convert_dict_to_config(dict_str, prune=False):
         prune: If True, apply pruning rules to reduce configs
 
     Returns:
-        Tuple of (formatted ROCmGemmConfig string, config_tuple for deduplication)
+        Tuple of (formatted ROCmGemmConfig string, config_tuple for deduplication, was_pruned)
     """
     try:
         # Remove leading "- " if present (common in YAML-style lists)
@@ -57,13 +57,20 @@ def convert_dict_to_config(dict_str, prune=False):
         if missing:
             raise ValueError(f"Missing required fields: {missing}")
 
+        # Track if this config was modified by pruning
+        was_pruned = False
+
         # Apply pruning rules if enabled
         if prune:
-            # Set all waves_per_eu to 0
+            # Check if waves_per_eu will be changed
+            if waves_per_eu != 0:
+                was_pruned = True
             waves_per_eu = 0
+
             # Set num_stages=3 to 2
             if num_stages == 3:
                 num_stages = 2
+                was_pruned = True
 
         # Create a tuple for deduplication (based on final output values)
         config_tuple = (block_size_m, block_size_n, block_size_k, num_stages,
@@ -72,10 +79,10 @@ def convert_dict_to_config(dict_str, prune=False):
         # Format the output
         output = f"            ROCmGemmConfig({block_size_m}, {block_size_n}, {block_size_k}, {num_stages}, {num_warps}, group_m={group_size_m}, waves_per_eu={waves_per_eu}, kpack={kpack}),"
 
-        return output, config_tuple
+        return output, config_tuple, was_pruned
 
     except Exception as e:
-        return f"# ERROR: Could not parse line: {e}", None
+        return f"# ERROR: Could not parse line: {e}", None, False
 
 
 def main():
@@ -108,6 +115,8 @@ def main():
         converted_lines = []
         seen_configs = set()  # Track unique configurations
         duplicates_count = 0
+        total_processed = 0
+        pruned_count = 0
 
         for i, line in enumerate(lines, 1):
             line = line.strip()
@@ -120,7 +129,12 @@ def main():
                 converted_lines.append(line)
                 continue
 
-            converted, config_tuple = convert_dict_to_config(line, prune=prune)
+            total_processed += 1
+            converted, config_tuple, was_pruned = convert_dict_to_config(line, prune=prune)
+
+            # Track pruning
+            if was_pruned:
+                pruned_count += 1
 
             # Skip if this is an error
             if config_tuple is None:
@@ -139,24 +153,28 @@ def main():
         # Output results
         output_text = '\n'.join(converted_lines)
 
+        # Print statistics to stderr (so they don't interfere with stdout output)
+        print(f"Total configs processed: {total_processed}", file=sys.stderr)
+        print(f"Successfully converted {len(converted_lines)} unique lines", file=sys.stderr)
+        if duplicates_count > 0:
+            print(f"Removed {duplicates_count} duplicate configurations", file=sys.stderr)
+        if prune:
+            print(f"Pruning applied: waves_per_eu=0, num_stages=3->2", file=sys.stderr)
+            print(f"Configs modified by pruning: {pruned_count}", file=sys.stderr)
+
         if output_file:
             with open(output_file, 'w') as f:
                 f.write(output_text)
                 f.write('\n')
-            print(f"Successfully converted {len(converted_lines)} unique lines")
-            if duplicates_count > 0:
-                print(f"Removed {duplicates_count} duplicate configurations")
-            if prune:
-                print(f"Pruning applied: waves_per_eu=0, num_stages=3->2")
-            print(f"Output written to: {output_file}")
+            print(f"Output written to: {output_file}", file=sys.stderr)
         else:
             print(output_text)
 
     except FileNotFoundError:
-        print(f"Error: File '{input_file}' not found")
+        print(f"Error: File '{input_file}' not found", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
 
