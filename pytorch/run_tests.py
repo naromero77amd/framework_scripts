@@ -47,7 +47,7 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
                (script run as __main__ can't take full id as positional). If False, use -k as-is.
 
     Returns:
-        tuple: (success: bool, elapsed_time: float)
+        tuple: (success: bool, elapsed_time: float, timed_out: bool)
     """
     test_file = Path(pytorch_path) / TEST_FILE_REL_PATH
 
@@ -98,7 +98,7 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         log_file.write(status_msg)
         log_file.flush()
         
-        return success, elapsed_time
+        return success, elapsed_time, False
         
     except subprocess.TimeoutExpired as e:
         elapsed_time = time.time() - start_time
@@ -118,7 +118,7 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
             pass
         log_file.flush()
         
-        return False, elapsed_time
+        return False, elapsed_time, True
         
     except Exception as e:
         elapsed_time = time.time() - start_time
@@ -126,7 +126,7 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         print(error_msg, end='')
         log_file.write(error_msg)
         log_file.flush()
-        return False, elapsed_time
+        return False, elapsed_time, False
 
 
 def discover_tests(pytorch_path, log_file):
@@ -273,20 +273,21 @@ FAILED_TEST_LINE_RE = re.compile(r'^\s+-\s+(.+?)\s+\(\d+\.\d+s\)\s*$')
 
 def parse_log_for_rerun(log_path):
     """
-    Parse a log file from a previous run to extract failed test names and mode.
+    Parse a log file from a previous run to extract failed test names, timed-out test names, and mode.
 
     Looks for a line "Mode: full_suite" or "Mode: csv" to determine how to run tests.
-    Looks for the "Failed tests:" section and parses lines "  - test_name (X.XXs)".
+    Looks for "Failed tests:" and "Timed out tests:" sections; parses lines "  - test_name (X.XXs)".
+    Logs from older runs may only have "Failed tests:" (all non-passed grouped there); in that case
+    timeout_tests will be empty.
 
     Returns:
-        tuple: (failed_test_names: list[str], mode: str or None).
-        mode is 'full_suite' or 'csv', or None if not found.
-        failed_test_names is empty if no Failed tests section or no entries.
+        tuple: (failed_test_names: list[str], timeout_test_names: list[str], mode: str or None).
+        mode is 'full_suite' or 'csv', or None if not found. On read error, returns (None, None, None).
     """
     try:
         content = Path(log_path).read_text(encoding='utf-8')
-    except OSError as e:
-        return None, None
+    except OSError:
+        return None, None, None
 
     mode = None
     for line in content.splitlines():
@@ -296,25 +297,31 @@ def parse_log_for_rerun(log_path):
             break
 
     failed_tests = []
+    timeout_tests = []
     in_failed_section = False
+    in_timeout_section = False
     for line in content.splitlines():
         stripped = line.strip()
         if stripped == 'Failed tests:':
             in_failed_section = True
+            in_timeout_section = False
             continue
-        if in_failed_section:
-            if stripped.startswith('====='):
-                break
-            match = FAILED_TEST_LINE_RE.match(line)
-            if match:
-                failed_tests.append(match.group(1).strip())
-            elif stripped:
-                # Non-matching line (e.g. blank or other format) - still in section
-                continue
-            else:
-                # Blank line might end the section in some formats
-                continue
-    return failed_tests, mode
+        if stripped == 'Timed out tests:':
+            in_failed_section = False
+            in_timeout_section = True
+            continue
+        if stripped.startswith('====='):
+            in_failed_section = False
+            in_timeout_section = False
+            continue
+        match = FAILED_TEST_LINE_RE.match(line)
+        if match:
+            name = match.group(1).strip()
+            if in_failed_section:
+                failed_tests.append(name)
+            elif in_timeout_section:
+                timeout_tests.append(name)
+    return failed_tests, timeout_tests, mode
 
 
 def _resolve_start_index(test_names, log_file_path, resume, no_checkpoint, log_file, not_in_list_msg):
@@ -385,8 +392,9 @@ def _run_test_batch(test_names, start_index, args, log_file, mode, by_id, count_
         print(progress_msg, end='')
         log_file.write(progress_msg)
         log_file.flush()
+        timed_out = False
         try:
-            success, elapsed = run_test(
+            success, elapsed, timed_out = run_test(
                 test_name, args.pytorch_path, log_file,
                 timeout=args.per_test_timeout,
                 by_id=by_id
@@ -398,13 +406,14 @@ def _run_test_batch(test_names, start_index, args, log_file, mode, by_id, count_
             log_file.write(timeout_msg)
             log_file.flush()
             success, elapsed = False, elapsed
+            timed_out = True
         except Exception as e:
             err_msg = f"✗ ERROR (uncaught): {type(e).__name__}: {e}\n"
             print(err_msg, end='')
             log_file.write(err_msg)
             log_file.flush()
             success, elapsed = False, 0.0
-        results.append({'name': test_name, 'success': success, 'time': elapsed})
+        results.append({'name': test_name, 'success': success, 'time': elapsed, 'timed_out': timed_out})
         if not args.no_checkpoint:
             next_test = test_names[i + 1] if i + 1 < len(test_names) else None
             write_checkpoint(
@@ -427,9 +436,15 @@ def _run_test_batch(test_names, start_index, args, log_file, mode, by_id, count_
     summary += f"Failed: {failed}\n"
     summary += f"Total time: {total_time:.2f}s\n"
     if failed > 0:
-        summary += f"\nFailed tests:\n"
-        for r in results:
-            if not r['success']:
+        failed_only = [r for r in results if not r['success'] and not r.get('timed_out')]
+        timed_out_only = [r for r in results if not r['success'] and r.get('timed_out')]
+        if failed_only:
+            summary += f"\nFailed tests:\n"
+            for r in failed_only:
+                summary += f"  - {r['name']} ({r['time']:.2f}s)\n"
+        if timed_out_only:
+            summary += f"\nTimed out tests:\n"
+            for r in timed_out_only:
                 summary += f"  - {r['name']} ({r['time']:.2f}s)\n"
     summary += f"{'='*70}\n\n"
     print(summary, end='')
@@ -460,7 +475,12 @@ def main():
         '--rerun-failed',
         metavar='LOG_FILE',
         default=None,
-        help='Re-run tests that failed or timed out; LOG_FILE is the log from a previous run'
+        help='Re-run tests that failed (and optionally timed out); LOG_FILE is the log from a previous run'
+    )
+    parser.add_argument(
+        '--rerun-include-timeouts',
+        action='store_true',
+        help='With --rerun-failed, also re-run tests that timed out (default: only re-run failed tests)'
     )
     parser.add_argument(
         '--pytorch-path',
@@ -540,29 +560,37 @@ def main():
         exit_code = 1  # default if we never run the batch
 
         if args.rerun_failed:
-            # Rerun mode: parse log for failed tests and mode, then run them
-            failed_tests, mode = parse_log_for_rerun(args.rerun_failed)
+            # Rerun mode: parse log for failed tests, timed-out tests, and mode
+            failed_tests, timeout_tests, mode = parse_log_for_rerun(args.rerun_failed)
             if failed_tests is None:
                 print(f"Error: Log file not found or could not be read: {args.rerun_failed}")
                 sys.exit(1)
             if mode is None:
                 print("Error: Log file must contain 'Mode: full_suite' or 'Mode: csv' (from a previous run of this script).")
                 sys.exit(1)
-            if not failed_tests:
-                msg = "No failed tests found in log. Nothing to re-run.\n"
+            tests_to_rerun = failed_tests
+            if args.rerun_include_timeouts:
+                tests_to_rerun = failed_tests + timeout_tests
+            if not tests_to_rerun:
+                msg = "No failed tests to re-run."
+                if timeout_tests and not args.rerun_include_timeouts:
+                    msg += " (Use --rerun-include-timeouts to also re-run timed out tests.)"
+                msg += "\n"
                 print(msg, end='')
                 log_file.write(msg)
                 log_file.flush()
                 exit_code = 0
             else:
                 msg = f"Re-running failed tests from: {args.rerun_failed}\n"
+                if args.rerun_include_timeouts and timeout_tests:
+                    msg += f"Including {len(timeout_tests)} timed out test(s).\n"
                 print(msg, end='')
                 log_file.write(msg)
                 log_file.write(f"Mode: {mode}\n")
                 log_file.flush()
-                count_msg = f"Re-running {len(failed_tests)} failed test(s). Per-test timeout: {args.per_test_timeout}s"
+                count_msg = f"Re-running {len(tests_to_rerun)} test(s). Per-test timeout: {args.per_test_timeout}s"
                 exit_code = _run_test_batch(
-                    failed_tests, 0, args, log_file, mode, by_id=(mode == 'full_suite'),
+                    tests_to_rerun, 0, args, log_file, mode, by_id=(mode == 'full_suite'),
                     count_msg=count_msg, summary_title="TEST SUMMARY (rerun failed)"
                 )
         elif args.all_tests:

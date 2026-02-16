@@ -1,6 +1,6 @@
 # PyTorch Unit Test Runner
 
-`run_tests.py` runs PyTorch unit tests from a single test file. It supports three modes: running tests from a CSV file, running the full discovered test suite, or re-running only tests that failed or timed out in a previous run. The test file path is defined in the script (`TEST_FILE_REL_PATH`); change it to target a different test module.
+`run_tests.py` runs PyTorch unit tests from a single test file. It supports three modes: running tests from a CSV file, running the full discovered test suite, or re-running only tests that failed (and optionally timed out) from a previous run. The test file path is defined in the script (`TEST_FILE_REL_PATH`); change it to target a different test module.
 
 ## Requirements
 
@@ -15,7 +15,7 @@ You must use exactly one of the following:
 |------|----------------|-------------|
 | **CSV** | Pass a CSV file path as a positional argument | Run only the tests listed in the CSV (column `test_name`). |
 | **Full suite** | `--all-tests` | Discover all tests via the test file’s `--discover-tests` and run each one. |
-| **Rerun failed** | `--rerun-failed LOG_FILE` | Parse a previous run’s log file and re-run only tests that failed or timed out. |
+| **Rerun failed** | `--rerun-failed LOG_FILE` | Parse a previous run’s log and re-run only tests that **failed** (not timeouts). Add `--rerun-include-timeouts` to also re-run timed-out tests. |
 
 Examples:
 
@@ -38,7 +38,8 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 |----------|----------|-------------|
 | `csv_file` | One of CSV / all-tests / rerun-failed | Path to CSV with a `test_name` column. Omit when using `--all-tests` or `--rerun-failed`. |
 | `--all-tests` | One of the three modes | Discover and run all tests in the configured test file. |
-| `--rerun-failed LOG_FILE` | One of the three modes | Re-run tests that failed or timed out; `LOG_FILE` is the log from a previous run. |
+| `--rerun-failed LOG_FILE` | One of the three modes | Re-run tests that failed; `LOG_FILE` is the log from a previous run. By default timed-out tests are excluded; use `--rerun-include-timeouts` to include them. |
+| `--rerun-include-timeouts` | No | With `--rerun-failed`, also re-run tests that timed out (default: only re-run failed tests). |
 | `--pytorch-path PATH` | Yes | Path to PyTorch directory (must contain the test file defined in the script). |
 | `--log-file PATH` | No | Where to write the run log. Default: `test_results_YYYYMMDD_HHMMSS.log`, or for rerun `{input_stem}.rerun_{timestamp}.log`. |
 | `--stop-on-failure` | No | Stop after the first failing test (default: continue). |
@@ -66,11 +67,13 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 ## Rerun-failed mode (`--rerun-failed LOG_FILE`)
 
 - **Input**: Path to a log file produced by a previous run of this script (CSV or full-suite).
+- **Default behavior**: Only tests that **failed** (assertion/error) are re-run. Tests that **timed out** are listed in the log but are not re-run unless you pass `--rerun-include-timeouts`.
 - **Parsing**: The script looks for:
-  - **Mode**: A line `Mode: full_suite` or `Mode: csv` (written by this script) so it knows whether to run tests by unittest id or by keyword.
-  - **Failed tests**: The “Failed tests:” summary section and lines like `  - test_name (X.XXs)` (failed or timed-out tests).
+  - **Mode**: A line `Mode: full_suite` or `Mode: csv` so it knows whether to run tests by unittest id or by keyword.
+  - **Failed tests**: The “Failed tests:” summary section (lines `  - test_name (X.XXs)`).
+  - **Timed out tests**: The “Timed out tests:” summary section (same line format). These are only re-run with `--rerun-include-timeouts`.
 - **Output**: A **new** log file is created (e.g. `test_results_20250216_120000.rerun_20250216_130000.log`), so the original log is not overwritten.
-- If the log contains no failed tests, the script prints “No failed tests found in log. Nothing to re-run.” and exits with code 0.
+- If there are no tests to re-run (no failures, or no failures and no timeouts with `--rerun-include-timeouts`), the script prints a message and exits with code 0.
 - If the log file is missing or does not contain a `Mode:` line, the script exits with an error.
 
 ---
@@ -90,7 +93,7 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 - Every run logs: PyTorch path, log file path, and (for rerun) “Re-running failed tests from: …”.
 - **Mode line**: CSV and full-suite runs write `Mode: csv` or `Mode: full_suite` near the top so that `--rerun-failed` can parse the log correctly.
 - For each test: a “Running: &lt;test_name&gt;” header, then test output, then a status line: `✓ PASSED`, `✗ FAILED`, or `✗ TIMEOUT`.
-- At the end: a summary with total run, passed, failed, total time, and (if any) a “Failed tests:” list used by `--rerun-failed`.
+- At the end: a summary with total run, passed, failed, total time, and (if any) separate “Failed tests:” and “Timed out tests:” sections used by `--rerun-failed` (and `--rerun-include-timeouts`).
 
 ---
 
@@ -115,4 +118,7 @@ python run_tests.py --all-tests --pytorch-path /path/to/pytorch --log-file full_
 
 # Re-run only the tests that failed in full_run.log; output to a new .rerun_*.log file
 python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed full_run.log
+
+# Re-run failed and timed-out tests from full_run.log
+python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed full_run.log --rerun-include-timeouts
 ```
