@@ -265,23 +265,202 @@ def read_tests_from_csv(csv_file):
         sys.exit(1)
 
 
+# Pattern for "Mode: full_suite" or "Mode: csv" at start of line (after strip)
+MODE_LINE_RE = re.compile(r'^Mode:\s*(full_suite|csv)\s*$')
+# Pattern for "  - test_name (12.34s)" in Failed tests section
+FAILED_TEST_LINE_RE = re.compile(r'^\s+-\s+(.+?)\s+\(\d+\.\d+s\)\s*$')
+
+
+def parse_log_for_rerun(log_path):
+    """
+    Parse a log file from a previous run to extract failed test names and mode.
+
+    Looks for a line "Mode: full_suite" or "Mode: csv" to determine how to run tests.
+    Looks for the "Failed tests:" section and parses lines "  - test_name (X.XXs)".
+
+    Returns:
+        tuple: (failed_test_names: list[str], mode: str or None).
+        mode is 'full_suite' or 'csv', or None if not found.
+        failed_test_names is empty if no Failed tests section or no entries.
+    """
+    try:
+        content = Path(log_path).read_text(encoding='utf-8')
+    except OSError as e:
+        return None, None
+
+    mode = None
+    for line in content.splitlines():
+        m = MODE_LINE_RE.match(line.strip())
+        if m:
+            mode = m.group(1)
+            break
+
+    failed_tests = []
+    in_failed_section = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped == 'Failed tests:':
+            in_failed_section = True
+            continue
+        if in_failed_section:
+            if stripped.startswith('====='):
+                break
+            match = FAILED_TEST_LINE_RE.match(line)
+            if match:
+                failed_tests.append(match.group(1).strip())
+            elif stripped:
+                # Non-matching line (e.g. blank or other format) - still in section
+                continue
+            else:
+                # Blank line might end the section in some formats
+                continue
+    return failed_tests, mode
+
+
+def _resolve_start_index(test_names, log_file_path, resume, no_checkpoint, log_file, not_in_list_msg):
+    """
+    Handle resume/checkpoint logic and return the index at which to start running tests.
+    Writes messages to console and log_file.
+    """
+    start_index = 0
+    if resume:
+        cp = read_checkpoint(log_file_path)
+        if not cp:
+            msg = "No checkpoint found, starting from first test.\n\n"
+            print(msg, end='')
+            log_file.write(msg)
+            log_file.flush()
+        elif cp.get('next_test') is None:
+            msg = "Checkpoint shows previous run completed (no next test). Starting from first test.\n\n"
+            print(msg, end='')
+            log_file.write(msg)
+            log_file.flush()
+        else:
+            next_t = cp['next_test']
+            if next_t in test_names:
+                start_index = test_names.index(next_t)
+                msg = f"Resuming from test: {next_t} [{start_index + 1}/{len(test_names)}]\n\n"
+                print(msg, end='')
+                log_file.write(msg)
+                log_file.flush()
+            else:
+                msg = f"Checkpoint next_test {not_in_list_msg}, starting from first test.\n\n"
+                print(msg, end='')
+                log_file.write(msg)
+                log_file.flush()
+    elif not no_checkpoint and read_checkpoint(log_file_path):
+        cp = read_checkpoint(log_file_path)
+        msg = f"Checkpoint from previous run: last test = {cp.get('last_test', '?')}, next test = {cp.get('next_test', '?')}. Use --resume to continue from next test.\n\n"
+        print(msg, end='')
+        log_file.write(msg)
+        log_file.flush()
+        try:
+            Path(checkpoint_path(log_file_path)).unlink(missing_ok=True)
+        except OSError:
+            pass
+    if not no_checkpoint and start_index == 0:
+        try:
+            Path(checkpoint_path(log_file_path)).unlink(missing_ok=True)
+        except OSError:
+            pass
+    return start_index
+
+
+def _run_test_batch(test_names, start_index, args, log_file, mode, by_id, count_msg, summary_title):
+    """
+    Run tests from start_index to end, write checkpoints, print summary.
+    Returns exit code (0 if all passed, 1 otherwise).
+    """
+    msg = f"{count_msg}\n\n"
+    print(msg, end='')
+    log_file.write(msg)
+    log_file.flush()
+
+    results = []
+    start_time = time.time()
+    for i in range(start_index, len(test_names)):
+        test_name = test_names[i]
+        idx_display = i + 1
+        progress_msg = f"[{idx_display}/{len(test_names)}] "
+        print(progress_msg, end='')
+        log_file.write(progress_msg)
+        log_file.flush()
+        try:
+            success, elapsed = run_test(
+                test_name, args.pytorch_path, log_file,
+                timeout=args.per_test_timeout,
+                by_id=by_id
+            )
+        except subprocess.TimeoutExpired:
+            elapsed = float(args.per_test_timeout)
+            timeout_msg = f"✗ TIMEOUT (uncaught in run_test) after {elapsed:.2f}s\n"
+            print(timeout_msg, end='')
+            log_file.write(timeout_msg)
+            log_file.flush()
+            success, elapsed = False, elapsed
+        except Exception as e:
+            err_msg = f"✗ ERROR (uncaught): {type(e).__name__}: {e}\n"
+            print(err_msg, end='')
+            log_file.write(err_msg)
+            log_file.flush()
+            success, elapsed = False, 0.0
+        results.append({'name': test_name, 'success': success, 'time': elapsed})
+        if not args.no_checkpoint:
+            next_test = test_names[i + 1] if i + 1 < len(test_names) else None
+            write_checkpoint(
+                args.log_file, test_name, next_test, i, len(test_names), mode,
+                csv_file=args.csv_file, pytorch_path=args.pytorch_path
+            )
+        if not success and args.stop_on_failure:
+            stop_msg = f"\nStopping due to test failure: {test_name}\n"
+            print(stop_msg, end='')
+            log_file.write(stop_msg)
+            log_file.flush()
+            break
+
+    total_time = time.time() - start_time
+    passed = sum(1 for r in results if r['success'])
+    failed = len(results) - passed
+    summary = f"\n{'='*70}\n{summary_title}\n{'='*70}\n"
+    summary += f"Total tests run: {len(results)}\n"
+    summary += f"Passed: {passed}\n"
+    summary += f"Failed: {failed}\n"
+    summary += f"Total time: {total_time:.2f}s\n"
+    if failed > 0:
+        summary += f"\nFailed tests:\n"
+        for r in results:
+            if not r['success']:
+                summary += f"  - {r['name']} ({r['time']:.2f}s)\n"
+    summary += f"{'='*70}\n\n"
+    print(summary, end='')
+    log_file.write(summary)
+    log_file.flush()
+    return 0 if failed == 0 else 1
+
+
 def main():
     """Main function to run all tests."""
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='Run PyTorch inductor tests from a CSV file or the full test suite'
+        description='Run PyTorch inductor tests from a CSV file, the full test suite, or re-run failed tests from a log file'
     )
     parser.add_argument(
         'csv_file',
         nargs='?',
         default=None,
-        help='Path to CSV file containing test names (required unless --all-tests is used)'
+        help='Path to CSV file containing test names (required unless --all-tests or --rerun-failed is used)'
     )
     parser.add_argument(
         '--all-tests',
         action='store_true',
         help='Run all tests in the inductor test suite (no CSV file needed)'
+    )
+    parser.add_argument(
+        '--rerun-failed',
+        metavar='LOG_FILE',
+        default=None,
+        help='Re-run tests that failed or timed out; LOG_FILE is the log from a previous run'
     )
     parser.add_argument(
         '--pytorch-path',
@@ -303,7 +482,7 @@ def main():
         type=int,
         default=300,
         metavar='SECONDS',
-        help='Per-test timeout in seconds for full-suite mode (default: 300)'
+        help='Per-test timeout in seconds for CSV and full-suite mode (default: 300)'
     )
     parser.add_argument(
         '--resume',
@@ -331,18 +510,22 @@ def main():
         print(f"Please verify the PyTorch path is correct.")
         sys.exit(1)
     
-    # Require either CSV file or --all-tests, not both, not neither
-    if args.all_tests and args.csv_file:
-        print("Error: Do not provide a CSV file when using --all-tests")
+    # Require exactly one of: CSV file, --all-tests, or --rerun-failed
+    modes_set = sum([bool(args.csv_file), args.all_tests, bool(args.rerun_failed)])
+    if modes_set == 0:
+        print("Error: Either provide a CSV file, use --all-tests, or use --rerun-failed LOG_FILE")
         sys.exit(1)
-    if not args.all_tests and not args.csv_file:
-        print("Error: Either provide a CSV file or use --all-tests")
+    if modes_set > 1:
+        print("Error: Use only one of: CSV file, --all-tests, or --rerun-failed")
         sys.exit(1)
     
     # Generate log file name if not provided
     if args.log_file is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        args.log_file = f'test_results_{timestamp}.log'
+        if args.rerun_failed:
+            args.log_file = f"{Path(args.rerun_failed).stem}.rerun_{timestamp}.log"
+        else:
+            args.log_file = f'test_results_{timestamp}.log'
     
     # Open log file
     log_file = open(args.log_file, 'w', encoding='utf-8')
@@ -354,11 +537,40 @@ def main():
         log_file.write(msg)
         log_file.flush()
 
-        if args.all_tests:
+        exit_code = 1  # default if we never run the batch
+
+        if args.rerun_failed:
+            # Rerun mode: parse log for failed tests and mode, then run them
+            failed_tests, mode = parse_log_for_rerun(args.rerun_failed)
+            if failed_tests is None:
+                print(f"Error: Log file not found or could not be read: {args.rerun_failed}")
+                sys.exit(1)
+            if mode is None:
+                print("Error: Log file must contain 'Mode: full_suite' or 'Mode: csv' (from a previous run of this script).")
+                sys.exit(1)
+            if not failed_tests:
+                msg = "No failed tests found in log. Nothing to re-run.\n"
+                print(msg, end='')
+                log_file.write(msg)
+                log_file.flush()
+                exit_code = 0
+            else:
+                msg = f"Re-running failed tests from: {args.rerun_failed}\n"
+                print(msg, end='')
+                log_file.write(msg)
+                log_file.write(f"Mode: {mode}\n")
+                log_file.flush()
+                count_msg = f"Re-running {len(failed_tests)} failed test(s). Per-test timeout: {args.per_test_timeout}s"
+                exit_code = _run_test_batch(
+                    failed_tests, 0, args, log_file, mode, by_id=(mode == 'full_suite'),
+                    count_msg=count_msg, summary_title="TEST SUMMARY (rerun failed)"
+                )
+        elif args.all_tests:
             # Full-suite mode: discover tests via --discover-tests, then run each with per-test timeout
             msg = "Discovering tests (--discover-tests)...\n"
             print(msg, end='')
             log_file.write(msg)
+            log_file.write("Mode: full_suite\n")
             log_file.flush()
             test_names = discover_tests(args.pytorch_path, log_file)
             if not test_names:
@@ -366,115 +578,24 @@ def main():
                 print(msg, end='')
                 log_file.write(msg)
                 log_file.flush()
-                exit_code = 1
             else:
                 mode = 'full_suite'
-                start_index = 0
-                if args.resume:
-                    cp = read_checkpoint(args.log_file)
-                    if not cp:
-                        msg = "No checkpoint found, starting from first test.\n\n"
-                        print(msg, end='')
-                        log_file.write(msg)
-                        log_file.flush()
-                    elif cp.get('next_test') is None:
-                        msg = "Checkpoint shows previous run completed (no next test). Starting from first test.\n\n"
-                        print(msg, end='')
-                        log_file.write(msg)
-                        log_file.flush()
-                    else:
-                        next_t = cp['next_test']
-                        if next_t in test_names:
-                            start_index = test_names.index(next_t)
-                            msg = f"Resuming from test: {next_t} [{start_index + 1}/{len(test_names)}]\n\n"
-                            print(msg, end='')
-                            log_file.write(msg)
-                            log_file.flush()
-                        else:
-                            msg = "Checkpoint next_test not in discovered list, starting from first test.\n\n"
-                            print(msg, end='')
-                            log_file.write(msg)
-                            log_file.flush()
-                elif not args.no_checkpoint and read_checkpoint(args.log_file):
-                    cp = read_checkpoint(args.log_file)
-                    msg = f"Checkpoint from previous run: last test = {cp.get('last_test', '?')}, next test = {cp.get('next_test', '?')}. Use --resume to continue from next test.\n\n"
-                    print(msg, end='')
-                    log_file.write(msg)
-                    log_file.flush()
-                    try:
-                        Path(checkpoint_path(args.log_file)).unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                if not args.no_checkpoint and start_index == 0:
-                    try:
-                        Path(checkpoint_path(args.log_file)).unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                msg = f"Found {len(test_names)} test(s). Per-test timeout: {args.per_test_timeout}s\n\n"
-                print(msg, end='')
-                log_file.write(msg)
-                log_file.flush()
-                results = []
-                start_time = time.time()
-                for i in range(start_index, len(test_names)):
-                    test_name = test_names[i]
-                    idx_display = i + 1
-                    progress_msg = f"[{idx_display}/{len(test_names)}] "
-                    print(progress_msg, end='')
-                    log_file.write(progress_msg)
-                    log_file.flush()
-                    try:
-                        success, elapsed = run_test(
-                            test_name, args.pytorch_path, log_file,
-                            timeout=args.per_test_timeout,
-                            by_id=True
-                        )
-                    except subprocess.TimeoutExpired:
-                        elapsed = float(args.per_test_timeout)
-                        timeout_msg = f"✗ TIMEOUT (uncaught in run_test) after {elapsed:.2f}s\n"
-                        print(timeout_msg, end='')
-                        log_file.write(timeout_msg)
-                        log_file.flush()
-                        success, elapsed = False, elapsed
-                    except Exception as e:
-                        err_msg = f"✗ ERROR (uncaught): {type(e).__name__}: {e}\n"
-                        print(err_msg, end='')
-                        log_file.write(err_msg)
-                        log_file.flush()
-                        success, elapsed = False, 0.0
-                    results.append({'name': test_name, 'success': success, 'time': elapsed})
-                    if not args.no_checkpoint:
-                        next_test = test_names[i + 1] if i + 1 < len(test_names) else None
-                        write_checkpoint(args.log_file, test_name, next_test, i, len(test_names), mode, pytorch_path=args.pytorch_path)
-                    if not success and args.stop_on_failure:
-                        stop_msg = f"\nStopping due to test failure: {test_name}\n"
-                        print(stop_msg, end='')
-                        log_file.write(stop_msg)
-                        log_file.flush()
-                        break
-                total_time = time.time() - start_time
-                passed = sum(1 for r in results if r['success'])
-                failed = len(results) - passed
-                summary = f"\n{'='*70}\nTEST SUMMARY (full suite)\n{'='*70}\n"
-                summary += f"Total tests run: {len(results)}\n"
-                summary += f"Passed: {passed}\n"
-                summary += f"Failed: {failed}\n"
-                summary += f"Total time: {total_time:.2f}s\n"
-                if failed > 0:
-                    summary += f"\nFailed tests:\n"
-                    for r in results:
-                        if not r['success']:
-                            summary += f"  - {r['name']} ({r['time']:.2f}s)\n"
-                summary += f"{'='*70}\n\n"
-                print(summary, end='')
-                log_file.write(summary)
-                log_file.flush()
-                exit_code = 0 if failed == 0 else 1
+                start_index = _resolve_start_index(
+                    test_names, args.log_file, args.resume, args.no_checkpoint, log_file,
+                    "not in discovered list"
+                )
+                count_msg = f"Found {len(test_names)} test(s). Per-test timeout: {args.per_test_timeout}s"
+                exit_code = _run_test_batch(
+                    test_names, start_index, args, log_file, mode, by_id=True,
+                    count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
+                )
         else:
             # CSV mode: read test names and run each one
             msg = f"Reading tests from: {args.csv_file}\n"
             print(msg, end='')
             log_file.write(msg)
+            log_file.write("Mode: csv\n")
+            log_file.flush()
             test_names = read_tests_from_csv(args.csv_file)
             if not test_names:
                 msg = "No tests found in CSV file.\n"
@@ -483,106 +604,16 @@ def main():
                 log_file.close()
                 sys.exit(1)
             mode = 'csv'
-            start_index = 0
-            if args.resume:
-                cp = read_checkpoint(args.log_file)
-                if not cp:
-                    msg = "No checkpoint found, starting from first test.\n\n"
-                    print(msg, end='')
-                    log_file.write(msg)
-                    log_file.flush()
-                elif cp.get('next_test') is None:
-                    msg = "Checkpoint shows previous run completed (no next test). Starting from first test.\n\n"
-                    print(msg, end='')
-                    log_file.write(msg)
-                    log_file.flush()
-                else:
-                    next_t = cp['next_test']
-                    if next_t in test_names:
-                        start_index = test_names.index(next_t)
-                        msg = f"Resuming from test: {next_t} [{start_index + 1}/{len(test_names)}]\n\n"
-                        print(msg, end='')
-                        log_file.write(msg)
-                        log_file.flush()
-                    else:
-                        msg = "Checkpoint next_test not in CSV list, starting from first test.\n\n"
-                        print(msg, end='')
-                        log_file.write(msg)
-                        log_file.flush()
-            elif not args.no_checkpoint and read_checkpoint(args.log_file):
-                cp = read_checkpoint(args.log_file)
-                msg = f"Checkpoint from previous run: last test = {cp.get('last_test', '?')}, next test = {cp.get('next_test', '?')}. Use --resume to continue from next test.\n\n"
-                print(msg, end='')
-                log_file.write(msg)
-                log_file.flush()
-                try:
-                    Path(checkpoint_path(args.log_file)).unlink(missing_ok=True)
-                except OSError:
-                    pass
-            if not args.no_checkpoint and start_index == 0:
-                try:
-                    Path(checkpoint_path(args.log_file)).unlink(missing_ok=True)
-                except OSError:
-                    pass
-            msg = f"Found {len(test_names)} test(s) to run\n\n"
-            print(msg, end='')
-            log_file.write(msg)
-            log_file.flush()
+            start_index = _resolve_start_index(
+                test_names, args.log_file, args.resume, args.no_checkpoint, log_file,
+                "not in CSV list"
+            )
+            count_msg = f"Found {len(test_names)} test(s) to run"
+            exit_code = _run_test_batch(
+                test_names, start_index, args, log_file, mode, by_id=False,
+                count_msg=count_msg, summary_title="TEST SUMMARY"
+            )
 
-            results = []
-            start_time = time.time()
-            for i in range(start_index, len(test_names)):
-                test_name = test_names[i]
-                idx_display = i + 1
-                progress_msg = f"[{idx_display}/{len(test_names)}] "
-                print(progress_msg, end='')
-                log_file.write(progress_msg)
-                log_file.flush()
-                try:
-                    success, elapsed = run_test(test_name, args.pytorch_path, log_file)
-                except subprocess.TimeoutExpired:
-                    elapsed = 300.0
-                    timeout_msg = f"✗ TIMEOUT (uncaught in run_test) after {elapsed:.2f}s\n"
-                    print(timeout_msg, end='')
-                    log_file.write(timeout_msg)
-                    log_file.flush()
-                    success, elapsed = False, elapsed
-                except Exception as e:
-                    err_msg = f"✗ ERROR (uncaught): {type(e).__name__}: {e}\n"
-                    print(err_msg, end='')
-                    log_file.write(err_msg)
-                    log_file.flush()
-                    success, elapsed = False, 0.0
-                results.append({'name': test_name, 'success': success, 'time': elapsed})
-                if not args.no_checkpoint:
-                    next_test = test_names[i + 1] if i + 1 < len(test_names) else None
-                    write_checkpoint(args.log_file, test_name, next_test, i, len(test_names), mode, csv_file=args.csv_file, pytorch_path=args.pytorch_path)
-                if not success and args.stop_on_failure:
-                    stop_msg = f"\nStopping due to test failure: {test_name}\n"
-                    print(stop_msg, end='')
-                    log_file.write(stop_msg)
-                    log_file.flush()
-                    break
-
-            total_time = time.time() - start_time
-            passed = sum(1 for r in results if r['success'])
-            failed = len(results) - passed
-            summary = f"\n{'='*70}\nTEST SUMMARY\n{'='*70}\n"
-            summary += f"Total tests run: {len(results)}\n"
-            summary += f"Passed: {passed}\n"
-            summary += f"Failed: {failed}\n"
-            summary += f"Total time: {total_time:.2f}s\n"
-            if failed > 0:
-                summary += f"\nFailed tests:\n"
-                for r in results:
-                    if not r['success']:
-                        summary += f"  - {r['name']} ({r['time']:.2f}s)\n"
-            summary += f"{'='*70}\n\n"
-            print(summary, end='')
-            log_file.write(summary)
-            log_file.flush()
-            exit_code = 0 if failed == 0 else 1
-        
     finally:
         log_file.close()
     
