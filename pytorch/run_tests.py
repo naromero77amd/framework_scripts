@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 # Relative path to the test file (under PyTorch root); used in run_test, discover_tests, main
-TEST_FILE_REL_PATH = 'test/inductor/test_cuda_repro.py'
+TEST_FILE_REL_PATH = 'test/inductor/test_torchinductor.py'
 
 
 class TeeOutput:
@@ -206,6 +206,7 @@ def discover_tests(pytorch_path, log_file):
             log_file.flush()
             return []
         lines = (result.stdout or '').strip().splitlines()
+        seen = set()
         run_ids = []
         for line in lines:
             s = line.strip()
@@ -214,11 +215,18 @@ def discover_tests(pytorch_path, log_file):
             # Skip unittest suite repr (one long line listing all tests)
             if s.startswith('<') or 'TestSuite tests=' in s:
                 continue
-            # "test_method (__main__.CudaReproTests.test_method)" -> use id in parens
-            match = re.match(r'.*\s+\((.+)\)\s*$', s)
-            if match:
-                run_ids.append(match.group(1).strip())
-            else:
+            # Parse verbose form "test_method (__main__.ClassName)" -> id is "ClassName.test_method"
+            verbose_match = re.match(r'^(test_\w+)\s+\(__main__\.(\w+)\)\s*$', s)
+            if verbose_match:
+                method_name, class_name = verbose_match.group(1), verbose_match.group(2)
+                test_id = f"{class_name}.{method_name}"
+                if test_id not in seen:
+                    seen.add(test_id)
+                    run_ids.append(test_id)
+                continue
+            # Collect short form "ClassName.test_method" (printed by _print_test_names at end)
+            if re.match(r'^\w+\.test_\w+', s) and s not in seen:
+                seen.add(s)
                 run_ids.append(s)
         return run_ids
     except subprocess.TimeoutExpired:
@@ -570,17 +578,23 @@ def main():
         action='store_true',
         help='Disable checkpointing (default: checkpoint after each test for resume)'
     )
+    parser.add_argument(
+        '--regex',
+        metavar='PATTERN',
+        default=None,
+        help='In full-suite mode (--all-tests), only run tests whose name matches PATTERN (regex). E.g. --regex GPUTest runs tests containing "GPUTest"'
+    )
 
     args = parser.parse_args()
-    
+
     # Verify PyTorch path exists
     pytorch_path = Path(args.pytorch_path)
     test_file = pytorch_path / TEST_FILE_REL_PATH
-    
+
     if not pytorch_path.exists():
         print(f"Error: PyTorch path does not exist: {args.pytorch_path}")
         sys.exit(1)
-    
+
     if not test_file.exists():
         print(f"Error: Test file not found at: {test_file}")
         print(f"Please verify the PyTorch path is correct.")
@@ -594,6 +608,8 @@ def main():
     if modes_set > 1:
         print("Error: Use only one of: CSV file, --all-tests, or --rerun-failed")
         sys.exit(1)
+    if args.regex and not args.all_tests:
+        print("Warning: --regex only applies to full-suite mode (--all-tests); ignoring --regex.\n")
     
     # Generate log file name if not provided
     if args.log_file is None:
@@ -663,16 +679,50 @@ def main():
                 log_file.write(msg)
                 log_file.flush()
             else:
-                mode = 'full_suite'
-                start_index = _resolve_start_index(
-                    test_names, args.log_file, args.resume, args.no_checkpoint, log_file,
-                    "not in discovered list"
-                )
-                count_msg = f"Found {len(test_names)} test(s). Per-test timeout: {args.per_test_timeout}s"
-                exit_code = _run_test_batch(
-                    test_names, start_index, args, log_file, mode, by_id=True,
-                    count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
-                )
+                # Apply --regex filter if given (only in full-suite mode)
+                if args.regex:
+                    try:
+                        pattern = re.compile(args.regex)
+                    except re.error as e:
+                        msg = f"Error: invalid regex pattern {args.regex!r}: {e}\n"
+                        print(msg, end='')
+                        log_file.write(msg)
+                        log_file.flush()
+                        sys.exit(1)
+                    original_count = len(test_names)
+                    test_names = [n for n in test_names if pattern.search(n)]
+                    msg = f"Filter --regex {args.regex!r}: {len(test_names)} test(s) match (from {original_count} discovered).\n"
+                    print(msg, end='')
+                    log_file.write(msg)
+                    log_file.flush()
+                    if not test_names:
+                        msg = "No tests match the regex. Nothing to run.\n"
+                        print(msg, end='')
+                        log_file.write(msg)
+                        log_file.flush()
+                        exit_code = 0
+                    else:
+                        mode = 'full_suite'
+                        start_index = _resolve_start_index(
+                            test_names, args.log_file, args.resume, args.no_checkpoint, log_file,
+                            "not in discovered list"
+                        )
+                        count_msg = f"Running {len(test_names)} test(s) (filtered). Per-test timeout: {args.per_test_timeout}s"
+                        exit_code = _run_test_batch(
+                            test_names, start_index, args, log_file, mode, by_id=True,
+                            count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
+                        )
+                else:
+                    mode = 'full_suite'
+                    start_index = _resolve_start_index(
+                        test_names, args.log_file, args.resume, args.no_checkpoint, log_file,
+                        "not in discovered list"
+                    )
+                    count_msg = f"Found {len(test_names)} test(s). Per-test timeout: {args.per_test_timeout}s"
+                    exit_code = _run_test_batch(
+                        test_names, start_index, args, log_file, mode, by_id=True,
+                        count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
+                    )
         else:
             # CSV mode: read test names and run each one
             msg = f"Reading tests from: {args.csv_file}\n"

@@ -14,7 +14,7 @@ You must use exactly one of the following:
 | Mode | How to invoke | Description |
 |------|----------------|-------------|
 | **CSV** | Pass a CSV file path as a positional argument | Run only the tests listed in the CSV (column `test_name`). |
-| **Full suite** | `--all-tests` | Discover all tests via the test file’s `--discover-tests` and run each one. |
+| **Full suite** | `--all-tests` | Discover all tests via the test file’s `--discover-tests` and run each one. Optionally filter by name with `--regex PATTERN`. |
 | **Rerun failed** | `--rerun-failed LOG_FILE` | Parse a previous run’s log and re-run only tests that **failed** (not timeouts). Add `--rerun-include-timeouts` to also re-run timed-out tests. |
 
 Examples:
@@ -23,8 +23,9 @@ Examples:
 # CSV mode
 python run_tests.py my_tests.csv --pytorch-path /path/to/pytorch
 
-# Full-suite mode
+# Full-suite mode (optionally filter by test name)
 python run_tests.py --pytorch-path /path/to/pytorch --all-tests
+python run_tests.py --pytorch-path /path/to/pytorch --all-tests --regex GPUTests
 
 # Rerun failed tests from a previous log
 python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_20250216_120000.log
@@ -46,6 +47,7 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 | `--per-test-timeout SECONDS` | No | Timeout per test in seconds (default: 300). Applies to CSV, full-suite, and rerun modes. |
 | `--resume` | No | Resume from the next test after the last run using the checkpoint for the given log file. |
 | `--no-checkpoint` | No | Disable writing checkpoints (default: checkpoint after each test for resume). |
+| `--regex PATTERN` | No | **Full-suite only.** Only run tests whose full name (e.g. `ClassName.test_method`) matches the regex. E.g. `--regex GPUTests` runs tests containing “GPUTests”. Ignored in CSV and rerun modes. |
 
 ---
 
@@ -59,8 +61,9 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 
 ## Full-suite mode (`--all-tests`)
 
-- Runs the test file with `--discover-tests` to get the full list of test identifiers (unittest-style ids).
+- Runs the test file with `--discover-tests` to get the full list of test identifiers (unittest-style ids). Discovery parses both the short form (`ClassName.test_method`) and the verbose form (`test_method (__main__.ClassName)`) so the list is complete even when output order or process exit varies.
 - Each test is run with a per-test timeout. Test names are passed by method name (e.g. `-k test_foo`) so that `__main__` resolution works correctly.
+- **`--regex PATTERN`**: When given, only tests whose full id matches the regex are run (e.g. `--regex GPUTests` to run only tests whose name contains “GPUTests”). The script reports how many tests match and how many were discovered before filtering. If no tests match, it exits successfully without running any tests.
 
 ---
 
@@ -128,6 +131,9 @@ python run_tests.py tests.csv --pytorch-path /path/to/pytorch --per-test-timeout
 
 # Run full suite, stop on first failure, custom log path
 python run_tests.py --all-tests --pytorch-path /path/to/pytorch --stop-on-failure --log-file full_run.log
+
+# Run only tests whose name contains GPUTests (full-suite mode)
+python run_tests.py --all-tests --pytorch-path /path/to/pytorch --regex GPUTests
 
 # Resume a previous run (same log file path)
 python run_tests.py --all-tests --pytorch-path /path/to/pytorch --log-file full_run.log --resume
