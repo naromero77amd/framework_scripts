@@ -32,6 +32,35 @@ class TeeOutput:
         self.log_file.flush()
 
 
+# Test outcome states (each test has exactly one)
+STATE_PASSED = "passed"
+STATE_SKIPPED = "skipped"
+STATE_ERROR = "error"
+STATE_FAILED = "failed"
+STATE_TIMEDOUT = "timedout"
+
+
+def _output_indicates_skipped(stdout: str, stderr: str) -> bool:
+    """
+    Parse captured stdout/stderr to detect if the test was skipped (vs passed).
+    Handles pytest (e.g. 'SKIPPED', '1 skipped') and unittest (e.g. 'OK (skipped=1)').
+    """
+    combined = (stdout or "") + "\n" + (stderr or "")
+    # Pytest: "test_foo SKIPPED" or summary "1 passed, 1 skipped" / "1 skipped"
+    if " SKIPPED" in combined or re.search(r"\d+\s+skipped", combined):
+        return True
+    # Unittest: "OK (skipped=1)" or "Ran 1 test ... OK (skipped=1)"
+    if "skipped=" in combined and "OK" in combined:
+        return True
+    return False
+
+
+def _output_indicates_runtime_error(stdout: str, stderr: str) -> bool:
+    """True if stdout/stderr contain RuntimeError (non-zero exit → classify as ERROR)."""
+    combined = (stdout or "") + "\n" + (stderr or "")
+    return "RuntimeError" in combined
+
+
 def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
     """
     Run a single test with the specified test name.
@@ -47,7 +76,8 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
                (script run as __main__ can't take full id as positional). If False, use -k as-is.
 
     Returns:
-        tuple: (success: bool, elapsed_time: float, timed_out: bool)
+        tuple: (success: bool, elapsed_time: float, timed_out: bool, state: str)
+        state is one of STATE_PASSED, STATE_SKIPPED, STATE_ERROR, STATE_FAILED, STATE_TIMEDOUT.
     """
     test_file = Path(pytorch_path) / TEST_FILE_REL_PATH
 
@@ -83,22 +113,36 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         
         elapsed_time = time.time() - start_time
         success = result.returncode == 0
-        
+        stdout_str = result.stdout or ""
+        stderr_str = result.stderr or ""
+
+        if success:
+            state = STATE_SKIPPED if _output_indicates_skipped(stdout_str, stderr_str) else STATE_PASSED
+        else:
+            state = STATE_ERROR if _output_indicates_runtime_error(stdout_str, stderr_str) else STATE_FAILED
+
         # Write all output to log file
         if result.stdout:
             log_file.write(result.stdout)
         if result.stderr:
             log_file.write(result.stderr)
         log_file.flush()
-        
-        # Print status to console
-        status = "✓ PASSED" if success else "✗ FAILED"
+
+        # Print status to console (five states: PASSED, SKIPPED, ERROR, FAILED, TIMEDOUT)
+        status_map = {
+            STATE_PASSED: "✓ PASSED",
+            STATE_SKIPPED: "✓ SKIPPED",
+            STATE_ERROR: "✗ ERROR",
+            STATE_FAILED: "✗ FAILED",
+            STATE_TIMEDOUT: "✗ TIMEDOUT",
+        }
+        status = status_map[state]
         status_msg = f"{status} ({elapsed_time:.2f}s)\n"
         print(status_msg, end='')
         log_file.write(status_msg)
         log_file.flush()
-        
-        return success, elapsed_time, False
+
+        return success, elapsed_time, False, state
         
     except subprocess.TimeoutExpired as e:
         elapsed_time = time.time() - start_time
@@ -117,16 +161,16 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         except (AttributeError, TypeError):
             pass
         log_file.flush()
-        
-        return False, elapsed_time, True
-        
+
+        return False, elapsed_time, True, STATE_TIMEDOUT
+
     except Exception as e:
         elapsed_time = time.time() - start_time
         error_msg = f"✗ ERROR: {str(e)}\n"
         print(error_msg, end='')
         log_file.write(error_msg)
         log_file.flush()
-        return False, elapsed_time, False
+        return False, elapsed_time, False, STATE_ERROR
 
 
 def discover_tests(pytorch_path, log_file):
@@ -393,8 +437,9 @@ def _run_test_batch(test_names, start_index, args, log_file, mode, by_id, count_
         log_file.write(progress_msg)
         log_file.flush()
         timed_out = False
+        state = STATE_FAILED
         try:
-            success, elapsed, timed_out = run_test(
+            success, elapsed, timed_out, state = run_test(
                 test_name, args.pytorch_path, log_file,
                 timeout=args.per_test_timeout,
                 by_id=by_id
@@ -405,15 +450,18 @@ def _run_test_batch(test_names, start_index, args, log_file, mode, by_id, count_
             print(timeout_msg, end='')
             log_file.write(timeout_msg)
             log_file.flush()
-            success, elapsed = False, elapsed
+            success, elapsed, state = False, elapsed, STATE_TIMEDOUT
             timed_out = True
         except Exception as e:
             err_msg = f"✗ ERROR (uncaught): {type(e).__name__}: {e}\n"
             print(err_msg, end='')
             log_file.write(err_msg)
             log_file.flush()
-            success, elapsed = False, 0.0
-        results.append({'name': test_name, 'success': success, 'time': elapsed, 'timed_out': timed_out})
+            success, elapsed, state = False, 0.0, STATE_ERROR
+        results.append({
+            'name': test_name, 'success': success, 'time': elapsed,
+            'timed_out': timed_out, 'state': state,
+        })
         if not args.no_checkpoint:
             next_test = test_names[i + 1] if i + 1 < len(test_names) else None
             write_checkpoint(
@@ -428,29 +476,37 @@ def _run_test_batch(test_names, start_index, args, log_file, mode, by_id, count_
             break
 
     total_time = time.time() - start_time
-    passed = sum(1 for r in results if r['success'])
-    failed = len(results) - passed
+    passed = sum(1 for r in results if r.get('state') == STATE_PASSED)
+    skipped_count = sum(1 for r in results if r.get('state') == STATE_SKIPPED)
+    error_count = sum(1 for r in results if r.get('state') == STATE_ERROR)
+    failed_count = sum(1 for r in results if r.get('state') == STATE_FAILED)
+    timedout_count = sum(1 for r in results if r.get('state') == STATE_TIMEDOUT)
     summary = f"\n{'='*70}\n{summary_title}\n{'='*70}\n"
     summary += f"Total tests run: {len(results)}\n"
     summary += f"Passed: {passed}\n"
-    summary += f"Failed: {failed}\n"
+    summary += f"Skipped: {skipped_count}\n"
+    summary += f"Error: {error_count}\n"
+    summary += f"Failed: {failed_count}\n"
+    summary += f"Timed out: {timedout_count}\n"
     summary += f"Total time: {total_time:.2f}s\n"
-    if failed > 0:
-        failed_only = [r for r in results if not r['success'] and not r.get('timed_out')]
-        timed_out_only = [r for r in results if not r['success'] and r.get('timed_out')]
-        if failed_only:
-            summary += f"\nFailed tests:\n"
-            for r in failed_only:
-                summary += f"  - {r['name']} ({r['time']:.2f}s)\n"
-        if timed_out_only:
-            summary += f"\nTimed out tests:\n"
-            for r in timed_out_only:
+    for state, label in [
+        (STATE_PASSED, "Passed"),
+        (STATE_SKIPPED, "Skipped"),
+        (STATE_ERROR, "Error"),
+        (STATE_FAILED, "Failed"),
+        (STATE_TIMEDOUT, "Timed out"),
+    ]:
+        subset = [r for r in results if r.get('state') == state]
+        if subset:
+            summary += f"\n{label} tests:\n"
+            for r in subset:
                 summary += f"  - {r['name']} ({r['time']:.2f}s)\n"
     summary += f"{'='*70}\n\n"
     print(summary, end='')
     log_file.write(summary)
     log_file.flush()
-    return 0 if failed == 0 else 1
+    any_bad = error_count > 0 or failed_count > 0 or timedout_count > 0
+    return 0 if not any_bad else 1
 
 
 def main():

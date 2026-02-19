@@ -88,19 +88,35 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 
 ---
 
+## Test outcome states
+
+Each test is classified into exactly one of five states by parsing the subprocess return code and captured stdout/stderr:
+
+| State      | When |
+|------------|------|
+| **PASSED** | Exit code 0 and output does not indicate a skip. |
+| **SKIPPED** | Exit code 0 and output indicates the test was skipped (e.g. pytest “SKIPPED” / “1 skipped”, or unittest “OK (skipped=1)”). |
+| **ERROR**  | Non-zero exit and **RuntimeError** appears in stdout or stderr. |
+| **FAILED** | Non-zero exit and no RuntimeError in output (e.g. assertion failure). |
+| **TIMEDOUT** | The test hit the per-test timeout (`--per-test-timeout`). |
+
+The script reports each state in the per-test status line and in the final summary (counts and optional lists per state).
+
+---
+
 ## Log file format
 
 - Every run logs: PyTorch path, log file path, and (for rerun) “Re-running failed tests from: …”.
 - **Mode line**: CSV and full-suite runs write `Mode: csv` or `Mode: full_suite` near the top so that `--rerun-failed` can parse the log correctly.
-- For each test: a “Running: &lt;test_name&gt;” header, then test output, then a status line: `✓ PASSED`, `✗ FAILED`, or `✗ TIMEOUT`.
-- At the end: a summary with total run, passed, failed, total time, and (if any) separate “Failed tests:” and “Timed out tests:” sections used by `--rerun-failed` (and `--rerun-include-timeouts`).
+- For each test: a “Running: &lt;test_name&gt;” header, then test output, then a status line: `✓ PASSED`, `✓ SKIPPED`, `✗ ERROR`, `✗ FAILED`, or `✗ TIMEDOUT`.
+- At the end: a summary with total run, counts for Passed / Skipped / Error / Failed / Timed out, total time, and (for each non-empty state) a section listing those tests. The “Failed tests:” and “Timed out tests:” sections are used by `--rerun-failed` (and `--rerun-include-timeouts`).
 
 ---
 
 ## Exit codes
 
-- **0**: All tests that were run passed (or nothing to run, e.g. rerun with no failures in the log).
-- **1**: At least one test failed, or an error (e.g. invalid arguments, missing log/mode for rerun, discovery failure).
+- **0**: No test ended in ERROR, FAILED, or TIMEDOUT (only PASSED and/or SKIPPED), or nothing to run (e.g. rerun with no failures in the log).
+- **1**: At least one test was ERROR, FAILED, or TIMEDOUT, or a script error (e.g. invalid arguments, missing log/mode for rerun, discovery failure).
 
 ---
 
