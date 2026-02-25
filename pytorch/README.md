@@ -14,7 +14,7 @@ You must use exactly one of the following:
 | Mode | How to invoke | Description |
 |------|----------------|-------------|
 | **CSV** | Pass a CSV file path as a positional argument | Run only the tests listed in the CSV (column `test_name`). |
-| **Full suite** | `--all-tests` | Discover all tests via the test file’s `--discover-tests` and run each one. Optionally filter by name with `--regex PATTERN`. |
+| **Full suite** | `--all-tests` | Discover all tests via `pytest <test_file> --collect-only` and run each one. Optionally filter by name with `--regex PATTERN`. |
 | **Rerun failed** | `--rerun-failed LOG_FILE` | Parse a previous run’s log and re-run only tests that **failed** (not timeouts). Add `--rerun-include-timeouts` to also re-run timed-out tests. |
 
 Examples:
@@ -61,7 +61,7 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 
 ## Full-suite mode (`--all-tests`)
 
-- Runs the test file with `--discover-tests` to get the full list of test identifiers (unittest-style ids). Discovery parses both the short form (`ClassName.test_method`) and the verbose form (`test_method (__main__.ClassName)`) so the list is complete even when output order or process exit varies.
+- Runs `pytest <test_file> --collect-only` to get the full list of test identifiers. The script parses pytest's output (node ID format or tree format) into run ids like `ClassName.test_method` or bare `test_function` for module-level tests.
 - Each test is run with a per-test timeout. Test names are passed by method name (e.g. `-k test_foo`) so that `__main__` resolution works correctly.
 - **`--regex PATTERN`**: When given, only tests whose full id matches the regex are run (e.g. `--regex GPUTests` to run only tests whose name contains “GPUTests”). The script reports how many tests match and how many were discovered before filtering. If no tests match, it exits successfully without running any tests.
 

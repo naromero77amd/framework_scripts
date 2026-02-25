@@ -173,19 +173,86 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         return False, elapsed_time, False, STATE_ERROR
 
 
+def _parse_pytest_collect_only_output(stdout: str):
+    """
+    Parse pytest --collect-only stdout into a list of test run ids (ClassName.test_method or test_function).
+    Supports two formats:
+    1) Node ID lines: path::Class::test_method or path::test_function
+    2) Tree format: <Class Name>, <Function test_method>
+    """
+    lines = (stdout or '').strip().splitlines()
+    seen = set()
+    run_ids = []
+
+    # Pattern for pytest node ID: file.py::Class::test_method or file.py::test_function
+    node_id_re = re.compile(r'^[\w/.-]+::(\w+)::(test_\w+)$')  # path::Class::method
+    node_id_func_re = re.compile(r'^[\w/.-]+::(test_\w+)$')     # path::function
+
+    # Patterns for tree format: <Class ClassName>, <Function test_method>
+    class_re = re.compile(r'<\s*Class\s+(\w+)\s*>')
+    function_re = re.compile(r'<\s*Function\s+(\w+)\s*>')
+
+    current_class = None
+
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+
+        # Node ID format: test_file.py::CudaReproTests::test_foo
+        m = node_id_re.match(s)
+        if m:
+            class_name, method_name = m.group(1), m.group(2)
+            test_id = f"{class_name}.{method_name}"
+            if test_id not in seen:
+                seen.add(test_id)
+                run_ids.append(test_id)
+            continue
+
+        # Node ID format (module-level function): test_file.py::test_foo
+        m = node_id_func_re.match(s)
+        if m:
+            test_id = m.group(1)
+            if test_id not in seen:
+                seen.add(test_id)
+                run_ids.append(test_id)
+            continue
+
+        # Tree format: <Class CudaReproTests>
+        m = class_re.search(s)
+        if m:
+            current_class = m.group(1)
+            continue
+
+        # Tree format: <Function test_foo>
+        m = function_re.search(s)
+        if m:
+            method_name = m.group(1)
+            test_id = f"{current_class}.{method_name}" if current_class else method_name
+            if test_id not in seen:
+                seen.add(test_id)
+                run_ids.append(test_id)
+            continue
+
+        # New Module in tree resets class
+        if re.search(r'<\s*Module\s+', s):
+            current_class = None
+
+    return run_ids
+
+
 def discover_tests(pytorch_path, log_file):
     """
-    Discover test names by running the test file with --discover-tests.
+    Discover test names by running pytest on the test file with --collect-only.
 
-    Parses stdout: skips unittest suite repr lines (e.g. "<unittest.suite.TestSuite ...>").
-    For lines like "test_method (__main__.Class.test_method)", extracts the id in
-    parentheses so we run by unittest id. Returns list of run ids to pass to the runner.
+    Parses pytest's collect-only output (node ID or tree format) into a list of
+    run ids (ClassName.test_method or test_function) for use with the runner.
 
     Returns:
-        list: List of test run ids (unittest id or plain name per line)
+        list: List of test run ids (ClassName.test_method or plain test_function name)
     """
     test_file = Path(pytorch_path) / TEST_FILE_REL_PATH
-    cmd = ['python', str(test_file), '--discover-tests']
+    cmd = ['pytest', str(test_file), '--collect-only']
     env = {
         **subprocess.os.environ.copy(),
         'PYTORCH_TEST_WITH_ROCM': '1'
@@ -205,29 +272,7 @@ def discover_tests(pytorch_path, log_file):
             log_file.write(msg)
             log_file.flush()
             return []
-        lines = (result.stdout or '').strip().splitlines()
-        seen = set()
-        run_ids = []
-        for line in lines:
-            s = line.strip()
-            if not s:
-                continue
-            # Skip unittest suite repr (one long line listing all tests)
-            if s.startswith('<') or 'TestSuite tests=' in s:
-                continue
-            # Parse verbose form "test_method (__main__.ClassName)" -> id is "ClassName.test_method"
-            verbose_match = re.match(r'^(test_\w+)\s+\(__main__\.(\w+)\)\s*$', s)
-            if verbose_match:
-                method_name, class_name = verbose_match.group(1), verbose_match.group(2)
-                test_id = f"{class_name}.{method_name}"
-                if test_id not in seen:
-                    seen.add(test_id)
-                    run_ids.append(test_id)
-                continue
-            # Collect short form "ClassName.test_method" (printed by _print_test_names at end)
-            if re.match(r'^\w+\.test_\w+', s) and s not in seen:
-                seen.add(s)
-                run_ids.append(s)
+        run_ids = _parse_pytest_collect_only_output(result.stdout)
         return run_ids
     except subprocess.TimeoutExpired:
         msg = "Discovery timed out.\n"
@@ -667,14 +712,14 @@ def main():
                 )
         elif args.all_tests:
             # Full-suite mode: discover tests via --discover-tests, then run each with per-test timeout
-            msg = "Discovering tests (--discover-tests)...\n"
+            msg = "Discovering tests (pytest --collect-only)...\n"
             print(msg, end='')
             log_file.write(msg)
             log_file.write("Mode: full_suite\n")
             log_file.flush()
             test_names = discover_tests(args.pytorch_path, log_file)
             if not test_names:
-                msg = "No tests discovered. Check that the test file supports --discover-tests.\n"
+                msg = "No tests discovered. Check that pytest can collect from the test file.\n"
                 print(msg, end='')
                 log_file.write(msg)
                 log_file.flush()
