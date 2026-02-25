@@ -66,14 +66,13 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
     Run a single test with the specified test name.
 
     Args:
-        test_name: Name of the test to run. When by_id=True this is a unittest id
-                   (e.g. __main__.CudaReproTests.test_foo); we run with -k <method_name>.
-                   When by_id=False, pass as -k <test_name> (CSV/keyword mode).
+        test_name: Name of the test to run. When by_id=True this is a full pytest node id
+                   (e.g. path::Class::test_method or path::Class::test_method[param]); we run
+                   pytest with that node id for 1:1 mapping. When by_id=False, pass as -k <test_name> (CSV/keyword mode).
         pytorch_path: Path to PyTorch directory
         log_file: File object to write logs to
         timeout: Timeout in seconds for this test (default 300)
-        by_id: If True, test_name is a unittest id; extract method name and use -k
-               (script run as __main__ can't take full id as positional). If False, use -k as-is.
+        by_id: If True, test_name is a full pytest node id; run pytest <node_id> from pytorch_path.
 
     Returns:
         tuple: (success: bool, elapsed_time: float, timed_out: bool, state: str)
@@ -82,12 +81,11 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
     test_file = Path(pytorch_path) / TEST_FILE_REL_PATH
 
     if by_id:
-        # Full-suite: test_name is e.g. __main__.CudaReproTests.test_3d_tiling.
-        # Passing that as positional breaks (unittest resolves __main__ wrongly). Use -k with method name.
-        method_name = test_name.split('.')[-1] if '.' in test_name else test_name
-        cmd = ['python', str(test_file), '-k', method_name]
+        # Full-suite: test_name is a full pytest node id (e.g. test/.../file.py::Class::test_method[param]).
+        # Run pytest with that node id from pytorch_path for 1:1 mapping (one run per collected item).
+        cmd = ['pytest', test_name]
     else:
-        # CSV/single: run by -k (keyword match)
+        # CSV/single: run by -k (keyword match) using python
         cmd = ['python', str(test_file), '-k', test_name]
 
     env = {
@@ -101,15 +99,12 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
     log_file.flush()
     
     start_time = time.time()
-    
+    run_kw = dict(env=env, capture_output=True, text=True, timeout=timeout)
+    if by_id:
+        run_kw['cwd'] = str(pytorch_path)
+
     try:
-        result = subprocess.run(
-            cmd,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
+        result = subprocess.run(cmd, **run_kw)
         
         elapsed_time = time.time() - start_time
         success = result.returncode == 0
@@ -173,86 +168,42 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         return False, elapsed_time, False, STATE_ERROR
 
 
-def _parse_pytest_collect_only_output(stdout: str):
+# Pytest node ID line (from --collect-only -q): path::Class::test_method or path::test_method[param]
+# Path can be relative (e.g. test/inductor/test_torchinductor.py). Param part may contain - and other chars.
+_NODE_ID_LINE_RE = re.compile(r'^[\w/.-]+::.+$')
+
+
+def _parse_pytest_collect_only_quiet(combined_output: str):
     """
-    Parse pytest --collect-only stdout into a list of test run ids (ClassName.test_method or test_function).
-    Supports two formats:
-    1) Node ID lines: path::Class::test_method or path::test_function
-    2) Tree format: <Class Name>, <Function test_method>
+    Parse pytest --collect-only -q output: one full node id per line.
+    Returns a list of node ids (e.g. path::Class::test_method or path::Class::test_method[param])
+    for 1:1 mapping: each collected item is run exactly once.
+    Skips non-node lines (e.g. "collected N items", "Running N items in this shard").
     """
-    lines = (stdout or '').strip().splitlines()
-    seen = set()
-    run_ids = []
-
-    # Pattern for pytest node ID: file.py::Class::test_method or file.py::test_function
-    node_id_re = re.compile(r'^[\w/.-]+::(\w+)::(test_\w+)$')  # path::Class::method
-    node_id_func_re = re.compile(r'^[\w/.-]+::(test_\w+)$')     # path::function
-
-    # Patterns for tree format: <Class ClassName>, <Function test_method>
-    class_re = re.compile(r'<\s*Class\s+(\w+)\s*>')
-    function_re = re.compile(r'<\s*Function\s+(\w+)\s*>')
-
-    current_class = None
-
+    lines = (combined_output or '').strip().splitlines()
+    node_ids = []
     for line in lines:
         s = line.strip()
         if not s:
             continue
-
-        # Node ID format: test_file.py::CudaReproTests::test_foo
-        m = node_id_re.match(s)
-        if m:
-            class_name, method_name = m.group(1), m.group(2)
-            test_id = f"{class_name}.{method_name}"
-            if test_id not in seen:
-                seen.add(test_id)
-                run_ids.append(test_id)
+        if s.lower().startswith('collected ') or s.lower().startswith('running '):
             continue
-
-        # Node ID format (module-level function): test_file.py::test_foo
-        m = node_id_func_re.match(s)
-        if m:
-            test_id = m.group(1)
-            if test_id not in seen:
-                seen.add(test_id)
-                run_ids.append(test_id)
-            continue
-
-        # Tree format: <Class CudaReproTests>
-        m = class_re.search(s)
-        if m:
-            current_class = m.group(1)
-            continue
-
-        # Tree format: <Function test_foo>
-        m = function_re.search(s)
-        if m:
-            method_name = m.group(1)
-            test_id = f"{current_class}.{method_name}" if current_class else method_name
-            if test_id not in seen:
-                seen.add(test_id)
-                run_ids.append(test_id)
-            continue
-
-        # New Module in tree resets class
-        if re.search(r'<\s*Module\s+', s):
-            current_class = None
-
-    return run_ids
+        if _NODE_ID_LINE_RE.match(s):
+            node_ids.append(s)
+    return node_ids
 
 
 def discover_tests(pytorch_path, log_file):
     """
-    Discover test names by running pytest on the test file with --collect-only.
-
-    Parses pytest's collect-only output (node ID or tree format) into a list of
-    run ids (ClassName.test_method or test_function) for use with the runner.
+    Discover tests by running pytest --collect-only -q (one node id per line).
+    Returns full pytest node ids for 1:1 mapping: each collected item is run
+    exactly once (including each parametrized variant).
 
     Returns:
-        list: List of test run ids (ClassName.test_method or plain test_function name)
+        list: List of full pytest node ids (e.g. path::Class::test_method or path::Class::test_method[param])
     """
     test_file = Path(pytorch_path) / TEST_FILE_REL_PATH
-    cmd = ['pytest', str(test_file), '--collect-only']
+    cmd = ['pytest', str(test_file), '--collect-only', '-q']
     env = {
         **subprocess.os.environ.copy(),
         'PYTORCH_TEST_WITH_ROCM': '1'
@@ -272,8 +223,9 @@ def discover_tests(pytorch_path, log_file):
             log_file.write(msg)
             log_file.flush()
             return []
-        run_ids = _parse_pytest_collect_only_output(result.stdout)
-        return run_ids
+        combined = (result.stdout or '') + '\n' + (result.stderr or '')
+        node_ids = _parse_pytest_collect_only_quiet(combined)
+        return node_ids
     except subprocess.TimeoutExpired:
         msg = "Discovery timed out.\n"
         print(msg, end='')
