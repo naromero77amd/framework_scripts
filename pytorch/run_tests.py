@@ -16,6 +16,26 @@ from pathlib import Path
 TEST_FILE_REL_PATH = 'test/inductor/test_torchinductor.py'
 
 
+def ensure_pytest_and_timeout_installed():
+    """
+    Verify that pytest and pytest-timeout are installed (same interpreter as this script).
+    Abort with a clear message if either is missing. Call before using pytest for discovery or execution.
+    """
+    result = subprocess.run(
+        [sys.executable, '-c', 'import pytest; import pytest_timeout'],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or '').strip()
+        print("Error: Full-suite mode requires pytest and pytest-timeout.")
+        print("Install them with:  pip install pytest pytest-timeout")
+        if err:
+            print(f"Details: {err}")
+        sys.exit(1)
+
+
 class TeeOutput:
     """Helper class to write to both console and log file."""
     def __init__(self, log_file):
@@ -61,6 +81,12 @@ def _output_indicates_runtime_error(stdout: str, stderr: str) -> bool:
     return "RuntimeError" in combined
 
 
+def _output_indicates_timeout(stdout: str, stderr: str) -> bool:
+    """True if stdout/stderr indicate pytest-timeout fired (classify as TIMEDOUT)."""
+    combined = (stdout or "") + "\n" + (stderr or "")
+    return "TimeoutExpired" in combined or "Timeout" in combined
+
+
 def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
     """
     Run a single test with the specified test name.
@@ -81,12 +107,11 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
     test_file = Path(pytorch_path) / TEST_FILE_REL_PATH
 
     if by_id:
-        # Full-suite: test_name is a full pytest node id (e.g. test/.../file.py::Class::test_method[param]).
-        # Run pytest with that node id from pytorch_path for 1:1 mapping (one run per collected item).
-        cmd = ['pytest', test_name]
+        # Full-suite: test_name is a full pytest node id. Per-test timeout via pytest-timeout.
+        cmd = ['pytest', '--timeout', str(timeout), test_name]
     else:
-        # CSV/single: run by -k (keyword match) using python
-        cmd = ['python', str(test_file), '-k', test_name]
+        # CSV: run pytest with -k (keyword match) and per-test timeout.
+        cmd = ['pytest', TEST_FILE_REL_PATH, '-k', test_name, '--timeout', str(timeout)]
 
     env = {
         **subprocess.os.environ.copy(),
@@ -99,9 +124,8 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
     log_file.flush()
     
     start_time = time.time()
-    run_kw = dict(env=env, capture_output=True, text=True, timeout=timeout)
-    if by_id:
-        run_kw['cwd'] = str(pytorch_path)
+    run_kw = dict(env=env, capture_output=True, text=True, cwd=str(pytorch_path))
+    # No subprocess timeout; pytest-timeout handles per-test timeout for both modes.
 
     try:
         result = subprocess.run(cmd, **run_kw)
@@ -110,11 +134,16 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         success = result.returncode == 0
         stdout_str = result.stdout or ""
         stderr_str = result.stderr or ""
+        timed_out = False
 
         if success:
             state = STATE_SKIPPED if _output_indicates_skipped(stdout_str, stderr_str) else STATE_PASSED
         else:
-            state = STATE_ERROR if _output_indicates_runtime_error(stdout_str, stderr_str) else STATE_FAILED
+            if _output_indicates_timeout(stdout_str, stderr_str):
+                state = STATE_TIMEDOUT
+                timed_out = True
+            else:
+                state = STATE_ERROR if _output_indicates_runtime_error(stdout_str, stderr_str) else STATE_FAILED
 
         # Write all output to log file
         if result.stdout:
@@ -137,8 +166,8 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         log_file.write(status_msg)
         log_file.flush()
 
-        return success, elapsed_time, False, state
-        
+        return success, elapsed_time, timed_out, state
+
     except subprocess.TimeoutExpired as e:
         elapsed_time = time.time() - start_time
         timeout_msg = f"✗ TIMEOUT after {elapsed_time:.2f}s (limit: {timeout}s)\n"
@@ -650,6 +679,7 @@ def main():
                 log_file.flush()
                 exit_code = 0
             else:
+                ensure_pytest_and_timeout_installed()
                 msg = f"Re-running failed tests from: {args.rerun_failed}\n"
                 if args.rerun_include_timeouts and timeout_tests:
                     msg += f"Including {len(timeout_tests)} timed out test(s).\n"
@@ -663,7 +693,8 @@ def main():
                     count_msg=count_msg, summary_title="TEST SUMMARY (rerun failed)"
                 )
         elif args.all_tests:
-            # Full-suite mode: discover tests via --discover-tests, then run each with per-test timeout
+            ensure_pytest_and_timeout_installed()
+            # Full-suite mode: discover tests, then run each with per-test timeout (pytest-timeout)
             msg = "Discovering tests (pytest --collect-only)...\n"
             print(msg, end='')
             log_file.write(msg)
@@ -721,7 +752,8 @@ def main():
                         count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
                     )
         else:
-            # CSV mode: read test names and run each one
+            # CSV mode: read test names and run each one (pytest -k, same as full-suite for execution)
+            ensure_pytest_and_timeout_installed()
             msg = f"Reading tests from: {args.csv_file}\n"
             print(msg, end='')
             log_file.write(msg)

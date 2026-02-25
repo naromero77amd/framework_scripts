@@ -6,6 +6,7 @@
 
 - **PyTorch path**: A directory containing the PyTorch source tree. The tree must contain the test file configured in the script (see `TEST_FILE_REL_PATH` in `run_tests.py`). Pass the PyTorch root with `--pytorch-path` (required for all modes).
 - The script sets `PYTORCH_TEST_WITH_ROCM=1` when invoking tests.
+- **pytest and pytest-timeout**: All modes run tests via pytest with per-test timeout from the pytest-timeout plugin. Install with `pip install pytest pytest-timeout`. The script checks that both are installed and aborts with a clear message if not.
 
 ## Modes
 
@@ -53,7 +54,7 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 
 ## CSV mode
 
-- The CSV must have a column named **`test_name`**. Each row’s value is used as a test name (keyword match with the test file’s `-k`).
+- The CSV must have a column named **`test_name`**. Each row’s value is used as a pytest keyword expression (`-k`). Tests are run with `pytest <test_file> -k <test_name> --timeout <seconds>` from the PyTorch path.
 - Empty `test_name` rows are skipped.
 - Tests are run in the order they appear in the CSV.
 
@@ -62,7 +63,7 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 ## Full-suite mode (`--all-tests`)
 
 - Runs `pytest <test_file> --collect-only -q` to get one full pytest node id per line (e.g. `path::Class::test_method` or `path::Class::test_method[param]`). This gives a **1:1 mapping**: each collected item (including each parametrized variant) is run exactly once.
-- Each test is run by invoking `pytest <node_id>` from the PyTorch path, with a per-test timeout.
+- Each test is run with `pytest --timeout <seconds> <node_id>` from the PyTorch path. The timeout is enforced by the **pytest-timeout** plugin (see Requirements).
 - **`--regex PATTERN`**: When given, only tests whose full id matches the regex are run (e.g. `--regex GPUTests` to run only tests whose name contains “GPUTests”). The script reports how many tests match and how many were discovered before filtering. If no tests match, it exits successfully without running any tests.
 
 ---
