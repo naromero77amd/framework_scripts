@@ -1,11 +1,11 @@
 # PyTorch Unit Test Runner
 
-`run_tests.py` runs PyTorch unit tests from a single test file. It supports three modes: running tests from a CSV file, running the full discovered test suite, or re-running only tests that failed (and optionally timed out) from a previous run. The test file path is defined in the script (`TEST_FILE_REL_PATH`); change it to target a different test module.
+`run_tests.py` runs PyTorch unit tests. It supports three modes: running tests from a CSV file, running the full discovered test suite (from one or more test files), or re-running only tests that failed (and optionally timed out) from a previous run. By default, full-suite mode uses the inductor test file (`test/inductor/test_torchinductor.py`). Use **`-i`** in full-suite mode to run other test files under `PYTORCH_PATH/test/` (e.g. `-i test_ops.py test_nn.py`).
 
 ## Requirements
 
-- **PyTorch path**: A directory containing the PyTorch source tree. The tree must contain the test file configured in the script (see `TEST_FILE_REL_PATH` in `run_tests.py`). Pass the PyTorch root with `--pytorch-path` (required for all modes).
-- The script sets `PYTORCH_TEST_WITH_ROCM=1` when invoking tests.
+- **PyTorch path**: A directory containing the PyTorch source tree. In full-suite mode without `-i`, the tree must contain the default inductor test file; with `-i`, it must contain each specified file under `test/`. Pass the PyTorch root with `--pytorch-path` (required for all modes).
+- The script sets `PYTORCH_TEST_WITH_ROCM=1`, `HSA_FORCE_FINE_GRAIN_PCIE=1`, and `PYTORCH_TESTING_DEVICE_ONLY_FOR=cuda` when invoking tests.
 - **pytest and pytest-timeout**: All modes run tests via pytest with per-test timeout from the pytest-timeout plugin. Install with `pip install pytest pytest-timeout`. The script checks that both are installed and aborts with a clear message if not.
 
 ## Modes
@@ -15,7 +15,7 @@ You must use exactly one of the following:
 | Mode | How to invoke | Description |
 |------|----------------|-------------|
 | **CSV** | Pass a CSV file path as a positional argument | Run only the tests listed in the CSV (column `test_name`). |
-| **Full suite** | `--all-tests` | Discover all tests via the test file’s `pytest <test_file> --collect-only` and run each one. Optionally filter by name with `--regex PATTERN`. |
+| **Full suite** | `--all-tests` | Discover all tests via `pytest <test_file(s)> --collect-only` and run each one. Use **`-i FILE [FILE ...]`** to specify test files under `PYTORCH_PATH/test/` (e.g. `-i test_ops.py test_nn.py`); default is the inductor test file. Optionally filter by name with `--regex PATTERN`. |
 | **Rerun failed** | `--rerun-failed LOG_FILE` | Parse a previous run’s log and re-run only tests that **failed** (not timeouts). Add `--rerun-include-timeouts` to also re-run timed-out tests. |
 
 Examples:
@@ -24,9 +24,12 @@ Examples:
 # CSV mode
 python run_tests.py my_tests.csv --pytorch-path /path/to/pytorch
 
-# Full-suite mode (optionally filter by test name)
+# Full-suite mode (default inductor test file; optionally filter by test name)
 python run_tests.py --pytorch-path /path/to/pytorch --all-tests
 python run_tests.py --pytorch-path /path/to/pytorch --all-tests --regex GPUTests
+
+# Full-suite mode with specific test files under PYTORCH_PATH/test/
+python run_tests.py --all-tests -i test_ops.py test_nn.py --pytorch-path /path/to/pytorch
 
 # Rerun failed tests from a previous log
 python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_20250216_120000.log
@@ -42,13 +45,14 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 | `--all-tests` | One of the three modes | Discover and run all tests in the configured test file. |
 | `--rerun-failed LOG_FILE` | One of the three modes | Re-run tests that failed; `LOG_FILE` is the log from a previous run. By default timed-out tests are excluded; use `--rerun-include-timeouts` to include them. |
 | `--rerun-include-timeouts` | No | With `--rerun-failed`, also re-run tests that timed out (default: only re-run failed tests). |
-| `--pytorch-path PATH` | Yes | Path to PyTorch directory (must contain the test file defined in the script). |
+| `--pytorch-path PATH` | Yes | Path to PyTorch directory (must contain the default test file or, with `-i`, each specified file under `test/`). |
 | `--log-file PATH` | No | Where to write the run log. Default: `test_results_YYYYMMDD_HHMMSS.log`, or for rerun `{input_stem}.rerun_{timestamp}.log`. |
 | `--stop-on-failure` | No | Stop after the first failing test (default: continue). |
 | `--per-test-timeout SECONDS` | No | Timeout per test in seconds (default: 300). Applies to CSV, full-suite, and rerun modes. |
 | `--resume` | No | Resume from the next test after the last run using the checkpoint for the given log file. |
 | `--no-checkpoint` | No | Disable writing checkpoints (default: checkpoint after each test for resume). |
 | `--regex PATTERN` | No | **Full-suite only.** Only run tests whose full name (e.g. `ClassName.test_method`) matches the regex. E.g. `--regex GPUTests` runs tests containing “GPUTests”. Ignored in CSV and rerun modes. |
+| `-i`, `--input-files FILE [FILE ...]` | No | **Full-suite only.** Run these test files under `PYTORCH_PATH/test/`. E.g. `-i test_ops.py test_nn.py` runs `test/test_ops.py` and `test/test_nn.py`. Default: inductor test file (`test/inductor/test_torchinductor.py`). Cannot be used without `--all-tests`. |
 
 ---
 
@@ -62,7 +66,8 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 
 ## Full-suite mode (`--all-tests`)
 
-- Runs `pytest <test_file> --collect-only -q` to get one full pytest node id per line (e.g. `path::Class::test_method` or `path::Class::test_method[param]`). This gives a **1:1 mapping**: each collected item (including each parametrized variant) is run exactly once.
+- **Test file(s)**: By default the script uses the inductor test file (`test/inductor/test_torchinductor.py`). Use **`-i FILE [FILE ...]`** to run one or more other test files under `PYTORCH_PATH/test/`. Each argument is a filename or path relative to `test/` (e.g. `-i test_ops.py test_nn.py` runs `test/test_ops.py` and `test/test_nn.py`). `-i` can only be used with `--all-tests`.
+- Runs `pytest <test_file(s)> --collect-only -q` to get one full pytest node id per line (e.g. `path::Class::test_method` or `path::Class::test_method[param]`). This gives a **1:1 mapping**: each collected item (including each parametrized variant) is run exactly once.
 - Each test is run with `pytest --timeout <seconds> <node_id>` from the PyTorch path. The timeout is enforced by the **pytest-timeout** plugin (see Requirements).
 - **`--regex PATTERN`**: When given, only tests whose full id matches the regex are run (e.g. `--regex GPUTests` to run only tests whose name contains “GPUTests”). The script reports how many tests match and how many were discovered before filtering. If no tests match, it exits successfully without running any tests.
 
@@ -135,6 +140,9 @@ python run_tests.py --all-tests --pytorch-path /path/to/pytorch --stop-on-failur
 
 # Run only tests whose name contains GPUTests (full-suite mode)
 python run_tests.py --all-tests --pytorch-path /path/to/pytorch --regex GPUTests
+
+# Run full suite from specific test files under test/
+python run_tests.py --all-tests -i test_ops.py test_nn.py --pytorch-path /path/to/pytorch
 
 # Resume a previous run (same log file path)
 python run_tests.py --all-tests --pytorch-path /path/to/pytorch --log-file full_run.log --resume

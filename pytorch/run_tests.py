@@ -115,7 +115,9 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
 
     env = {
         **subprocess.os.environ.copy(),
-        'PYTORCH_TEST_WITH_ROCM': '1'
+        'PYTORCH_TEST_WITH_ROCM': '1',
+        'HSA_FORCE_FINE_GRAIN_PCIE': '1',
+        'PYTORCH_TESTING_DEVICE_ONLY_FOR': 'cuda',
     }
     
     header = f"\n{'='*70}\nRunning: {test_name}\n{'='*70}\n"
@@ -222,20 +224,30 @@ def _parse_pytest_collect_only_quiet(combined_output: str):
     return node_ids
 
 
-def discover_tests(pytorch_path, log_file):
+def discover_tests(pytorch_path, log_file, test_file_rel_paths=None):
     """
     Discover tests by running pytest --collect-only -q (one node id per line).
     Returns full pytest node ids for 1:1 mapping: each collected item is run
     exactly once (including each parametrized variant).
 
+    Args:
+        pytorch_path: Path to PyTorch directory.
+        log_file: File object to write logs to.
+        test_file_rel_paths: Optional list of relative paths (under pytorch_path) for test files.
+                             If None, uses [TEST_FILE_REL_PATH].
+
     Returns:
         list: List of full pytest node ids (e.g. path::Class::test_method or path::Class::test_method[param])
     """
-    test_file = Path(pytorch_path) / TEST_FILE_REL_PATH
-    cmd = ['pytest', str(test_file), '--collect-only', '-q']
+    if test_file_rel_paths is None:
+        test_file_rel_paths = [TEST_FILE_REL_PATH]
+    test_paths = [str(Path(pytorch_path) / p) for p in test_file_rel_paths]
+    cmd = ['pytest'] + test_paths + ['--collect-only', '-q']
     env = {
         **subprocess.os.environ.copy(),
-        'PYTORCH_TEST_WITH_ROCM': '1'
+        'PYTORCH_TEST_WITH_ROCM': '1',
+        'HSA_FORCE_FINE_GRAIN_PCIE': '1',
+        'PYTORCH_TESTING_DEVICE_ONLY_FOR': 'cuda',
     }
     try:
         result = subprocess.run(
@@ -610,21 +622,42 @@ def main():
         default=None,
         help='In full-suite mode (--all-tests), only run tests whose name matches PATTERN (regex). E.g. --regex GPUTest runs tests containing "GPUTest"'
     )
+    parser.add_argument(
+        '-i', '--input-files',
+        nargs='+',
+        default=None,
+        metavar='FILE',
+        help='In full-suite mode (--all-tests): run these test files under PYTORCH_PATH/test/ (e.g. -i test_ops.py test_nn.py). Default: test/inductor/test_torchinductor.py'
+    )
 
     args = parser.parse_args()
 
+    # -i only applies to full-suite mode
+    if args.input_files is not None and not args.all_tests:
+        print("Error: -i/--input-files can only be used with --all-tests")
+        sys.exit(1)
+
     # Verify PyTorch path exists
     pytorch_path = Path(args.pytorch_path)
-    test_file = pytorch_path / TEST_FILE_REL_PATH
 
     if not pytorch_path.exists():
         print(f"Error: PyTorch path does not exist: {args.pytorch_path}")
         sys.exit(1)
 
-    if not test_file.exists():
-        print(f"Error: Test file not found at: {test_file}")
-        print(f"Please verify the PyTorch path is correct.")
-        sys.exit(1)
+    # Resolve test file(s) to check: -i list (under test/) or default single file
+    if args.all_tests and args.input_files:
+        test_file_rel_paths = [str(Path('test') / f) for f in args.input_files]
+        for rel in test_file_rel_paths:
+            if not (pytorch_path / rel).exists():
+                print(f"Error: Test file not found at: {pytorch_path / rel}")
+                print("Please verify -i filenames and PyTorch path.")
+                sys.exit(1)
+    else:
+        test_file = pytorch_path / TEST_FILE_REL_PATH
+        if not test_file.exists():
+            print(f"Error: Test file not found at: {test_file}")
+            print(f"Please verify the PyTorch path is correct.")
+            sys.exit(1)
     
     # Require exactly one of: CSV file, --all-tests, or --rerun-failed
     modes_set = sum([bool(args.csv_file), args.all_tests, bool(args.rerun_failed)])
@@ -700,7 +733,10 @@ def main():
             log_file.write(msg)
             log_file.write("Mode: full_suite\n")
             log_file.flush()
-            test_names = discover_tests(args.pytorch_path, log_file)
+            test_file_rel_paths = None
+            if args.input_files:
+                test_file_rel_paths = [str(Path('test') / f) for f in args.input_files]
+            test_names = discover_tests(args.pytorch_path, log_file, test_file_rel_paths=test_file_rel_paths)
             if not test_names:
                 msg = "No tests discovered. Check that pytest can collect from the test file.\n"
                 print(msg, end='')
