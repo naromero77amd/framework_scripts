@@ -4,6 +4,7 @@ Script to run PyTorch inductor unit tests from a CSV file.
 """
 
 import csv
+import io
 import json
 import re
 import subprocess
@@ -18,19 +19,19 @@ TEST_FILE_REL_PATH = 'test/inductor/test_torchinductor.py'
 
 def ensure_pytest_and_timeout_installed():
     """
-    Verify that pytest and pytest-timeout are installed (same interpreter as this script).
-    Abort with a clear message if either is missing. Call before using pytest for discovery or execution.
+    Verify that pytest, pytest-timeout, and expecttest are installed (same interpreter as this script).
+    Abort with a clear message if any are missing. Call before using pytest for discovery or execution.
     """
     result = subprocess.run(
-        [sys.executable, '-c', 'import pytest; import pytest_timeout'],
+        [sys.executable, '-c', 'import pytest; import pytest_timeout; import expecttest'],
         capture_output=True,
         text=True,
         timeout=10,
     )
     if result.returncode != 0:
         err = (result.stderr or result.stdout or '').strip()
-        print("Error: Full-suite mode requires pytest and pytest-timeout.")
-        print("Install them with:  pip install pytest pytest-timeout")
+        print("Error: This script requires pytest, pytest-timeout, and expecttest.")
+        print("Install them with:  pip install pytest pytest-timeout expecttest")
         if err:
             print(f"Details: {err}")
         sys.exit(1)
@@ -204,6 +205,84 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
 _NODE_ID_LINE_RE = re.compile(r'^[\w/.-]+::.+$')
 
 
+# Regex to parse "collected N items" from pytest --collect-only output
+_COLLECTED_RE = re.compile(r'collected\s+(\d+)\s+item', re.IGNORECASE)
+# Regex for <UnitTestCase ...> where the group name is the second token (e.g. <UnitTestCase TestClass> or <UnitTestCase 'TestClass'>)
+_UNIT_TEST_CASE_RE = re.compile(r'<UnitTestCase\s+[\'"]?([^\'">\s]+)[\'"]?>')
+# Lines that represent a test item (leaf node) under a UnitTestCase
+_TEST_ITEM_RE = re.compile(r'<\s*(?:TestCase)?Function\s+')
+
+
+def _parse_collect_only_hierarchy(combined_output: str):
+    """
+    Parse pytest --collect-only (non-quiet) output for hierarchical breakdown by UnitTestCase.
+    Returns a dict mapping group name (test class name) to count of test items under it.
+    """
+    breakdown = {}
+    current_group = None
+    for line in (combined_output or '').splitlines():
+        unit_match = _UNIT_TEST_CASE_RE.search(line)
+        if unit_match:
+            current_group = unit_match.group(1)
+            if current_group not in breakdown:
+                breakdown[current_group] = 0
+            continue
+        if current_group is not None and _TEST_ITEM_RE.search(line):
+            breakdown[current_group] += 1
+    return breakdown
+
+
+def _run_collect_only_and_parse(pytorch_path, cmd):
+    """
+    Run pytest with the given command (must include --collect-only, without -q to get hierarchy),
+    capture output, and parse for total collected count and hierarchical breakdown by UnitTestCase.
+    Uses the same env as discover_tests/run_test for consistency.
+    Returns (total: int, breakdown: dict[str, int]). On failure or parse error, returns (0, {}).
+    """
+    env = {
+        **subprocess.os.environ.copy(),
+        'PYTORCH_TEST_WITH_ROCM': '1',
+        'HSA_FORCE_FINE_GRAIN_PCIE': '1',
+        'PYTORCH_TESTING_DEVICE_ONLY_FOR': 'cuda',
+    }
+    try:
+        result = subprocess.run(
+            cmd,
+            env=env,
+            cwd=str(pytorch_path),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        combined = (result.stdout or '') + '\n' + (result.stderr or '')
+        total = 0
+        m = _COLLECTED_RE.search(combined)
+        if m:
+            total = int(m.group(1))
+        breakdown = _parse_collect_only_hierarchy(combined)
+        return total, breakdown
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        return 0, {}
+
+
+def _do_collect_only_and_exit(pytorch_path, test_names, by_id):
+    """
+    Build the appropriate pytest --collect-only command, run it, print total and hierarchical
+    breakdown by test class (UnitTestCase), then exit 0. No log file is used.
+    by_id: if True, test_names are pytest node ids; else they are -k keywords and we use TEST_FILE_REL_PATH.
+    """
+    if by_id:
+        cmd = ['pytest', '--collect-only'] + test_names
+    else:
+        cmd = ['pytest', TEST_FILE_REL_PATH, '-k', ' or '.join(test_names), '--collect-only']
+    total, breakdown = _run_collect_only_and_parse(pytorch_path, cmd)
+    print(f"Total tests: {total}")
+    if breakdown:
+        for group_name in sorted(breakdown.keys()):
+            print(f"  {group_name}: {breakdown[group_name]}")
+    sys.exit(0)
+
+
 def _parse_pytest_collect_only_quiet(combined_output: str):
     """
     Parse pytest --collect-only -q output: one full node id per line.
@@ -321,6 +400,7 @@ def read_checkpoint(log_file_path):
 def read_tests_from_csv(csv_file):
     """
     Read test names from CSV file.
+    Rows whose test_name starts with '#' are treated as comments and skipped.
     
     Args:
         csv_file: Path to CSV file
@@ -341,7 +421,7 @@ def read_tests_from_csv(csv_file):
             
             for row in reader:
                 test_name = row['test_name'].strip()
-                if test_name:  # Skip empty rows
+                if test_name and not test_name.startswith('#'):  # Skip empty rows and comments
                     test_names.append(test_name)
         
         return test_names
@@ -629,6 +709,11 @@ def main():
         metavar='FILE',
         help='In full-suite mode (--all-tests): run these test files under PYTORCH_PATH/test/ (e.g. -i test_ops.py test_nn.py). Default: test/inductor/test_torchinductor.py'
     )
+    parser.add_argument(
+        '--collect-only',
+        action='store_true',
+        help='Only count tests (no execution). Use with CSV file, --all-tests, or --rerun-failed. Prints total tests and number skipped due to decorators.'
+    )
 
     args = parser.parse_args()
 
@@ -670,23 +755,24 @@ def main():
     if args.regex and not args.all_tests:
         print("Warning: --regex only applies to full-suite mode (--all-tests); ignoring --regex.\n")
     
-    # Generate log file name if not provided
+    # Generate log file name if not provided (only used when not --collect-only)
     if args.log_file is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         if args.rerun_failed:
             args.log_file = f"{Path(args.rerun_failed).stem}.rerun_{timestamp}.log"
         else:
             args.log_file = f'test_results_{timestamp}.log'
-    
-    # Open log file
-    log_file = open(args.log_file, 'w', encoding='utf-8')
-    
+
+    # In collect-only mode we don't create a log file (use in-memory buffer for any internal writes)
+    log_file = io.StringIO() if args.collect_only else open(args.log_file, 'w', encoding='utf-8')
+
     try:
-        msg = f"PyTorch path: {args.pytorch_path}\n"
-        msg += f"Logging to: {args.log_file}\n\n"
-        print(msg, end='')
-        log_file.write(msg)
-        log_file.flush()
+        if not args.collect_only:
+            msg = f"PyTorch path: {args.pytorch_path}\n"
+            msg += f"Logging to: {args.log_file}\n\n"
+            print(msg, end='')
+            log_file.write(msg)
+            log_file.flush()
 
         exit_code = 1  # default if we never run the batch
 
@@ -713,6 +799,8 @@ def main():
                 exit_code = 0
             else:
                 ensure_pytest_and_timeout_installed()
+                if args.collect_only:
+                    _do_collect_only_and_exit(args.pytorch_path, tests_to_rerun, by_id=(mode == 'full_suite'))
                 msg = f"Re-running failed tests from: {args.rerun_failed}\n"
                 if args.rerun_include_timeouts and timeout_tests:
                     msg += f"Including {len(timeout_tests)} timed out test(s).\n"
@@ -766,6 +854,8 @@ def main():
                         log_file.flush()
                         exit_code = 0
                     else:
+                        if args.collect_only:
+                            _do_collect_only_and_exit(args.pytorch_path, test_names, by_id=True)
                         mode = 'full_suite'
                         start_index = _resolve_start_index(
                             test_names, args.log_file, args.resume, args.no_checkpoint, log_file,
@@ -777,6 +867,8 @@ def main():
                             count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
                         )
                 else:
+                    if args.collect_only:
+                        _do_collect_only_and_exit(args.pytorch_path, test_names, by_id=True)
                     mode = 'full_suite'
                     start_index = _resolve_start_index(
                         test_names, args.log_file, args.resume, args.no_checkpoint, log_file,
@@ -802,6 +894,8 @@ def main():
                 log_file.write(msg)
                 log_file.close()
                 sys.exit(1)
+            if args.collect_only:
+                _do_collect_only_and_exit(args.pytorch_path, test_names, by_id=False)
             mode = 'csv'
             start_index = _resolve_start_index(
                 test_names, args.log_file, args.resume, args.no_checkpoint, log_file,

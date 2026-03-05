@@ -6,7 +6,7 @@
 
 - **PyTorch path**: A directory containing the PyTorch source tree. In full-suite mode without `-i`, the tree must contain the default inductor test file; with `-i`, it must contain each specified file under `test/`. Pass the PyTorch root with `--pytorch-path` (required for all modes).
 - The script sets `PYTORCH_TEST_WITH_ROCM=1`, `HSA_FORCE_FINE_GRAIN_PCIE=1`, and `PYTORCH_TESTING_DEVICE_ONLY_FOR=cuda` when invoking tests.
-- **pytest and pytest-timeout**: All modes run tests via pytest with per-test timeout from the pytest-timeout plugin. Install with `pip install pytest pytest-timeout`. The script checks that both are installed and aborts with a clear message if not.
+- **pytest, pytest-timeout, and expecttest**: All modes run tests via pytest with per-test timeout from the pytest-timeout plugin. The script checks that pytest, pytest-timeout, and expecttest are installed and aborts with a clear message if any are missing. Install with `pip install pytest pytest-timeout expecttest`.
 
 ## Modes
 
@@ -53,13 +53,14 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 | `--no-checkpoint` | No | Disable writing checkpoints (default: checkpoint after each test for resume). |
 | `--regex PATTERN` | No | **Full-suite only.** Only run tests whose full name (e.g. `ClassName.test_method`) matches the regex. E.g. `--regex GPUTests` runs tests containing “GPUTests”. Ignored in CSV and rerun modes. |
 | `-i`, `--input-files FILE [FILE ...]` | No | **Full-suite only.** Run these test files under `PYTORCH_PATH/test/`. E.g. `-i test_ops.py test_nn.py` runs `test/test_ops.py` and `test/test_nn.py`. Default: inductor test file (`test/inductor/test_torchinductor.py`). Cannot be used without `--all-tests`. |
+| `--collect-only` | No | **Count-only mode.** Use with CSV file, `--all-tests`, or `--rerun-failed`. Does not run any tests; prints total test count and a hierarchical breakdown by test class (from `pytest --collect-only`). No log file is created; output goes to the screen only. |
 
 ---
 
 ## CSV mode
 
 - The CSV must have a column named **`test_name`**. Each row’s value is used as a pytest keyword expression (`-k`). Tests are run with `pytest <test_file> -k <test_name> --timeout <seconds>` from the PyTorch path.
-- Empty `test_name` rows are skipped.
+- Empty `test_name` rows are skipped. Rows whose **`test_name`** starts with **`#`** are treated as comments and skipped (e.g. `#test_foo` or `# Optional test`).
 - Tests are run in the order they appear in the CSV.
 
 ---
@@ -84,6 +85,29 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 - **Output**: A **new** log file is created (e.g. `test_results_20250216_120000.rerun_20250216_130000.log`), so the original log is not overwritten.
 - If there are no tests to re-run (no failures, or no failures and no timeouts with `--rerun-include-timeouts`), the script prints a message and exits with code 0.
 - If the log file is missing or does not contain a `Mode:` line, the script exits with an error.
+
+---
+
+## Collect-only mode (`--collect-only`)
+
+- **Use with any mode**: Pass **`--collect-only`** together with a CSV file, **`--all-tests`**, or **`--rerun-failed LOG_FILE`**. The script resolves the same test list as it would for a real run, then runs **`pytest --collect-only`** (without `-q`) on that set and prints counts only; no tests are executed.
+- **No log file**: In collect-only mode no log file is created or written. All output goes to the screen.
+- **Output**: Prints **Total tests: N** and a **hierarchical breakdown** by test class. The breakdown is parsed from pytest’s collect-only output: each **`<UnitTestCase ClassName>`** group is listed with its test count (e.g. `  CommonTemplate: 45`). Counts include parametrized variants (each variant is one collected item).
+- **Typical use**: To see how many tests would run and how they are grouped by class before doing a full run.
+
+Example:
+
+```bash
+# Count tests from CSV
+python run_tests.py my_tests.csv --pytorch-path /path/to/pytorch --collect-only
+
+# Count tests in full suite (optionally with --regex)
+python run_tests.py --all-tests --pytorch-path /path/to/pytorch --collect-only
+python run_tests.py --all-tests --pytorch-path /path/to/pytorch --regex GPUTest --collect-only
+
+# Count tests that would be re-run from a previous log
+python run_tests.py --rerun-failed previous.log --pytorch-path /path/to/pytorch --collect-only
+```
 
 ---
 
@@ -152,4 +176,8 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed full_run.log
 
 # Re-run failed and timed-out tests from full_run.log
 python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed full_run.log --rerun-include-timeouts
+
+# Count tests only (no run, no log file); works with CSV, --all-tests, or --rerun-failed
+python run_tests.py --all-tests --pytorch-path /path/to/pytorch --collect-only
+python run_tests.py tests.csv --pytorch-path /path/to/pytorch --collect-only
 ```
