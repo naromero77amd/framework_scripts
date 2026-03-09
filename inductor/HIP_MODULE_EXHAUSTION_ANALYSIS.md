@@ -144,10 +144,24 @@ and adding `_unload_kernel()` / `__del__` to `StaticallyLaunchedTritonKernel`.
 | Triton `CompiledKernel` (autotuning benchmarks) | **Yes** (provides `__del__`) | **Yes** (forces timely `__del__`) | No (different path) |
 | PyTorch `_StaticCudaLauncher` (winner kernel loading) | No (irrelevant path) | No (no `__del__` to trigger) | **Yes** (adds handle + `__del__`) |
 
-**All three are needed for a complete solution.** Triton PR #9444 is a
-prerequisite for Patch 1 — they form a chain: PR #9444 adds the cleanup
-logic, Patch 1 ensures it runs in time. Patch 2 independently covers the
-second loading path that neither PR #9444 nor Patch 1 can reach.
+**Practical impact assessment:**
+
+The autotuning benchmark path (row 1) is the **dominant** source of module
+leaks — each GEMM autotuning round creates ~145 `CompiledKernel` objects, of
+which ~144 become garbage. Across 8 recompilations with many GEMMs, this
+accumulates ~17,500 leaked modules and is what causes the crash.
+
+The winner kernel path (row 2) leaks far fewer modules: only the selected
+winner kernels (~50 per recompilation × 8 recompilations ≈ 400 modules).
+This is orders of magnitude below the crash threshold.
+
+**PR #9444 + Patch 1 are sufficient to fix the crash in practice.** Together
+they clean up the massive autotuning leaks that exhaust the module table.
+Patch 2 is a correctness fix that plugs the smaller winner-kernel leak, but
+in realistic workloads (≤ tens of recompilations) those ~400 modules alone
+would not exhaust the driver. Patch 2 would become necessary in a
+hypothetical scenario with hundreds of recompilations, where winner-kernel
+leaks alone could accumulate enough to hit the limit.
 
 ### Evidence: GC objects collected per iteration
 
