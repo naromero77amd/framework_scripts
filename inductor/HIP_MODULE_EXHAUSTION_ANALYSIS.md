@@ -42,9 +42,9 @@ TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE=EXHAUSTIVE python repro_tiny.py
 
 ---
 
-## Bug 2 — HIP Module Exhaustion at compilation `[0/7]` (ROOT-CAUSED)
+## Bug 2 — HIP Module Exhaustion at compilation `[0/7]` (FIXED)
 
-### Status: ROOT-CAUSED — patches available
+### Status: FIXED — Patch 2 (static launcher module unload) resolves the crash
 
 ### Root Cause
 
@@ -104,9 +104,12 @@ than GC can collect them:
   module loading far outpaces the rate of GC-driven unloading.
 - By the time GC runs, thousands of stale modules have accumulated.
 
-The `gc.collect()` workaround (patch 1) forces immediate collection after each
-autotuning round, ensuring the stale `CompiledKernel.__del__` methods fire
-before the next round begins. This addresses the timing mismatch.
+The v1 patch tried to address this with `gc.collect()` alone, but
+`PyCodeCache` class-level collections held strong references to the
+benchmark modules, preventing GC from collecting the `CompiledKernel`
+objects. The v2 patch (`gc_module_unload_v2.patch`) first evicts losing
+benchmark modules from `PyCodeCache`, severing the reference chains, then
+calls `gc.collect()` to ensure `CompiledKernel.__del__` fires promptly.
 
 **Reason 2: PyTorch's `_StaticCudaLauncher` bypasses Triton's cleanup entirely**
 
@@ -129,39 +132,48 @@ separate code path.
 The C++ patch (patch 2) fixes this by returning the module handle to Python
 and adding `_unload_kernel()` / `__del__` to `StaticallyLaunchedTritonKernel`.
 
-**Summary of all three fixes and their dependencies:**
+**Summary of all fixes and their dependencies:**
 
 | Fix | What it does | Standalone? |
 |---|---|---|
-| **Triton PR #9444** | Adds `CompiledKernel.__del__` → `hipModuleUnload` / `cuModuleUnload` | Necessary but not sufficient (GC fires too late) |
-| **Patch 1** (`gc_module_unload.patch`) | Calls `gc.collect()` after autotuning to force timely `__del__` | **Requires PR #9444** — without it, `CompiledKernel` has no `__del__`, so `gc.collect()` reclaims the objects but no modules are unloaded |
-| **Patch 2** (`static_launcher_module_unload.patch`) | Returns module handle from C++, adds `__del__` to `StaticallyLaunchedTritonKernel` | Self-contained (adds its own cleanup, independent of Triton) |
+| **Triton PR #9444** | Adds `CompiledKernel.__del__` → `hipModuleUnload` / `cuModuleUnload` | Necessary but not sufficient (GC fires too late; strong refs prevent collection) |
+| **Patch 1 v1** (`gc_module_unload.patch`) | Calls `gc.collect()` after autotuning | **Insufficient** — `PyCodeCache` holds strong refs, preventing GC from collecting `CompiledKernel` objects |
+| **Patch 1 v2** (`gc_module_unload_v2.patch`) | Evicts losing benchmark modules from `PyCodeCache`, then `gc.collect()` | **Requires PR #9444** — severs reference chains so GC can collect `CompiledKernel` and trigger `hipModuleUnload` |
+| **Patch 2** (`static_launcher_module_unload.patch`) | Returns module handle from C++, adds `__del__` to `StaticallyLaunchedTritonKernel` | **Self-contained and sufficient** — adds its own cleanup, independent of Triton; verified to resolve the full workload crash alone |
 
 **Which fixes cover which module loading path:**
 
-| Module loading path | PR #9444 needed? | Patch 1 (gc.collect) needed? | Patch 2 (C++ fix) needed? |
+| Module loading path | PR #9444 needed? | Patch 1 v2 (evict + gc) needed? | Patch 2 (C++ fix) needed? |
 |---|---|---|---|
-| Triton `CompiledKernel` (autotuning benchmarks) | **Yes** (provides `__del__`) | **Yes** (forces timely `__del__`) | No (different path) |
+| Triton `CompiledKernel` (autotuning benchmarks) | **Yes** (provides `__del__`) | **Yes** (severs refs + forces `__del__`) | No (different path) |
 | PyTorch `_StaticCudaLauncher` (winner kernel loading) | No (irrelevant path) | No (no `__del__` to trigger) | **Yes** (adds handle + `__del__`) |
 
 **Practical impact assessment:**
 
-The autotuning benchmark path (row 1) is the **dominant** source of module
-leaks — each GEMM autotuning round creates ~145 `CompiledKernel` objects, of
-which ~144 become garbage. Across 8 recompilations with many GEMMs, this
-accumulates ~17,500 leaked modules and is what causes the crash.
+The autotuning benchmark path (row 1) generates the **bulk of module
+churn** — each GEMM autotuning round creates ~145 `CompiledKernel` objects,
+of which ~144 become garbage. However, Triton PR #9444's
+`CompiledKernel.__del__` reclaims these when Python's GC eventually runs.
+The temporary pressure from stale autotuning modules causes non-fatal
+errors that Inductor catches ("Ignoring this choice"), but does not crash
+the process.
 
-The winner kernel path (row 2) leaks far fewer modules: only the selected
-winner kernels (~50 per recompilation × 8 recompilations ≈ 400 modules).
-This is orders of magnitude below the crash threshold.
+The winner kernel path (row 2) loads far fewer modules (~50 per compilation
+cycle), but **before Patch 2, these modules were permanently leaked** —
+the `CUmodule` handle was discarded in C++ with no way to ever unload it.
+Over 7+ compilation cycles, these ~350+ permanently leaked modules pushed
+the total module count past the HIP driver's limit. Because the fatal
+crash occurred in `_load_kernel()` (loading the **next** winner kernel),
+**Patch 2 alone is sufficient** to resolve it — by enabling cleanup of
+winner kernel modules from previous compilation cycles, the persistent
+module count stays low enough for the system to survive.
 
-**PR #9444 + Patch 1 are sufficient to fix the crash in practice.** Together
-they clean up the massive autotuning leaks that exhaust the module table.
-Patch 2 is a correctness fix that plugs the smaller winner-kernel leak, but
-in realistic workloads (≤ tens of recompilations) those ~400 modules alone
-would not exhaust the driver. Patch 2 would become necessary in a
-hypothetical scenario with hundreds of recompilations, where winner-kernel
-leaks alone could accumulate enough to hit the limit.
+**Patch 2 is both necessary and sufficient for the full workload.**
+Testing confirmed that the full `workload_v4.py` with `EXHAUSTIVE`
+autotuning passes with Patch 2 alone (no Patch 1 needed). Patch 1 v2
+(PyCodeCache eviction + gc.collect) is a useful optimization that reduces
+temporary module table pressure, but is not required for correctness when
+Patch 2 is applied.
 
 ### Evidence: GC objects collected per iteration
 
@@ -192,14 +204,27 @@ iter 7 [0/8]:      7 objects collected   ← cache_size_limit hit, eager fallbac
   the crash harder to hit in practice. But with enough EXHAUSTIVE autotuning
   rounds, CUDA would eventually exhaust its limit too.
 
-### Patch 1: Minimal Fix (PyTorch Python-side)
+### Patch 1 v1: Minimal Fix (PyTorch Python-side) — SUPERSEDED
 
-Add `gc.collect()` after each autotuning benchmark round in
-`torch/_inductor/select_algorithm.py`. This forces Python to run
-`CompiledKernel.__del__` → `hipModuleUnload()` / `cuModuleUnload()` between
-rounds, preventing module accumulation through Triton's loading path.
+The original v1 patch simply added `gc.collect()` after `benchmark_fn()`.
+This was **necessary but not sufficient**: `PyCodeCache.modules` (a
+class-level list) and `PyCodeCache.modules_no_attr` (a class-level dict)
+held strong references to the benchmark template modules, which in turn
+held `CachingAutotuner` → `compile_results` → `CompiledKernel` reference
+chains. These strong references prevented `gc.collect()` from actually
+freeing the `CompiledKernel` objects.
 
-Patch file: `gc_module_unload.patch`
+Patch file (historical): `gc_module_unload.patch`
+
+### Patch 1 v2: PyCodeCache Eviction + GC Fix — CURRENT
+
+The v2 patch first **evicts losing benchmark template modules from
+`PyCodeCache`** to break the strong reference chains, then calls
+`gc.collect()`. This makes the `CompiledKernel` objects truly unreachable
+so GC can collect them and trigger `hipModuleUnload` / `cuModuleUnload`
+via `__del__`.
+
+Patch file: `gc_module_unload_v2.patch`
 
 ```diff
 --- a/torch/_inductor/select_algorithm.py
@@ -210,25 +235,51 @@ Patch file: `gc_module_unload.patch`
  import functools
 +import gc
  import hashlib
- ...
-@@ -3228,7 +3229,18 @@ class AlgorithmSelectorCache(PersistentCache):
+ import inspect
+ import itertools
+@@ -3338,7 +3339,30 @@ class AlgorithmSelectorCache(PersistentCache):
          )
-         # `benchmark_fn(choices)` will execute each choice ...
+         # `benchmark_fn(choices)` will execute each choice, and return a dict[choice, timing] which
+         # maps each choice to its runtime, calculated by the specified benchmarker, in milliseconds
 -        return benchmark_fn(choices)
 +        result = benchmark_fn(choices)
 +
-+        # Collect stale CompiledKernel objects from benchmarking.  Each
-+        # autotuning round compiles many Triton kernel variants (up to ~145
-+        # with EXHAUSTIVE search).  Only the winner is kept; the rest become
-+        # garbage.  On ROCm, CompiledKernel.__del__ calls hipModuleUnload()
-+        # (triton-lang/triton#9444) to free the loaded GPU module.  Without
-+        # an explicit gc.collect() here, the modules accumulate faster than
-+        # Python's cyclic GC can reclaim them, eventually exhausting the HIP
-+        # driver's module table and raising hipErrorNoBinaryForGpu (error 209).
++        # Evict benchmark template modules from PyCodeCache so their
++        # CachingAutotuner → compile_results → CompiledKernel chains become
++        # unreachable.  Without this, PyCodeCache.modules (a class-level list)
++        # and PyCodeCache.modules_no_attr (a class-level dict) hold strong
++        # references that prevent GC from ever collecting the CompiledKernel
++        # objects and triggering hipModuleUnload / cuModuleUnload via __del__.
++        evict_paths = set()
++        for choice in choices:
++            bmreq = getattr(choice, "bmreq", None)
++            if bmreq is not None:
++                path = getattr(bmreq, "module_path", None)
++                if path is not None:
++                    evict_paths.add(path)
++        if evict_paths:
++            for path in evict_paths:
++                PyCodeCache.modules_no_attr.pop(path, None)
++            PyCodeCache.modules[:] = [
++                m for m in PyCodeCache.modules
++                if getattr(m, "__file__", None) not in evict_paths
++            ]
++
 +        gc.collect()
 +
 +        return result
+ 
+     def autotune(
+         self,
 ```
+
+**Why v2 is needed over v1:**
+
+| Issue | v1 (`gc.collect()` only) | v2 (evict + `gc.collect()`) |
+|---|---|---|
+| Breaks `PyCodeCache` strong refs | No — modules remain in `PyCodeCache.modules` and `modules_no_attr` | **Yes** — evicts losing benchmark modules |
+| `CompiledKernel` objects collectible | No — still reachable via `PyCodeCache` → module → `CachingAutotuner` → `compile_results` → `CompiledKernel` | **Yes** — reference chain severed |
+| `hipModuleUnload` actually fires | Partial — only collects objects not held by `PyCodeCache` | **Yes** — all stale `CompiledKernel` objects collected |
 
 ### Patch 2: Complete Fix (PyTorch C++ + Python side)
 
@@ -271,15 +322,128 @@ TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE=EXHAUSTIVE python repro_bug2_gc.py
 
 ### Experimental Results
 
-| Test | COMPILE_THREADS | gc.collect()? | `[0/7]` result | Total time |
+| Test | Patch | COMPILE_THREADS | `[0/7]` result | Total time |
 |---|---|---|---|---|
-| Default (32 threads) | 32 | No | **CRASH** | ~5 min |
-| Single-threaded | 1 | No | Pass | ~15 min |
-| Reduced threads | 4 | No | Pass | ~10 min |
-| Default + GC | 32 | Yes | **Pass** | ~5 min |
+| Default (32 threads) | None | 32 | **CRASH** | ~5 min |
+| Single-threaded | None | 1 | Pass | ~15 min |
+| Reduced threads | None | 4 | Pass | ~10 min |
+| Default + GC v1 | `gc_module_unload.patch` (gc.collect only) | 32 | **Pass** | ~5 min |
+| Default + GC v1 (`repro_bug2_gc.py`) | `gc_module_unload.patch` (gc.collect in repro script) | 32 | **Pass** | ~5 min |
+| Default + GC v2 (`workload_v4.py`) | `gc_module_unload_v2.patch` (evict + gc.collect) | 32 | **CRASH** | ~58 min |
+| **Patch 2 only** (`workload_v4.py`) | Static launcher module unload (commit `4406fa22`) | 32 | **Pass** | ~52 min |
+| **Patch 2 + GC v1** (`workload_v4.py`) | Static launcher + `gc_module_unload.patch` | 32 | **Pass** | ~57 min |
 
-The `gc.collect()` fix is the best option: it runs at full speed (32 threads)
-and avoids the crash.
+**v1 caveat:** The v1 "Pass" result was on the smaller `repro_bug2_gc.py`
+reproducer, which manually calls `gc.collect()` between training iterations.
+The full workload (`workload_v4.py`) was never tested with v1.
+
+**v2 full-workload test result (`test_patch_v2.log`):**
+
+The v2 patch **reduced the leak rate** but did **not eliminate the crash**.
+The process survived through `[0/6]` but at `[0/7]`:
+
+1. **220 autotuning errors** — individual Triton kernel benchmarks failed
+   with error 209 during the `[0/7]` backward autotuning. Inductor caught
+   these ("Ignoring this choice") and continued, but by the end **all**
+   remaining kernel variants showed `inf ms` (all failed).
+
+2. **Fatal crash in `_StaticCudaLauncher._load_kernel()`** — after
+   autotuning completed, Inductor tried to load the winner kernels via
+   `static_triton_launcher.py:144 → self.C_impl._load_kernel()`. By this
+   point the HIP module table was fully exhausted and the load failed
+   fatally with `CUDA driver error: 209`.
+
+Stack trace (crash point):
+```
+triton_heuristics.py:503, in precompile → self._make_launchers()
+triton_heuristics.py:659, in _make_launchers → result.make_launcher()
+triton_heuristics.py:1795, in make_launcher → self.kernel.load_kernel(device)
+static_triton_launcher.py:144, in load_kernel
+    (self.function, self.n_regs, self.n_spills) = self.C_impl._load_kernel(...)
+InductorError: RuntimeError: CUDA driver error: 209
+```
+
+**Why v2 was insufficient:**
+
+The `PyCodeCache` eviction + `gc.collect()` breaks one reference chain, but
+there are likely **additional strong reference holders** keeping stale
+`CompiledKernel` objects alive across autotuning rounds. Possible sources:
+
+- **`CachingAutotuner.compile_results`** or other caches internal to
+  `triton_heuristics.py` that accumulate across compilations
+- **`async_compile` futures** holding references to compiled kernels
+- **`_StaticCudaLauncher`** winner kernel modules accumulating (this path
+  has no unload mechanism at all — addressed by Patch 2)
+- Other `PyCodeCache` entries loaded outside the `benchmark_fn()` path
+  (e.g. the final compiled graph module loaded via `load_by_key_path`)
+
+### Why Patch 2 Alone Resolves the Problem
+
+Testing confirmed that Patch 2 (commit `4406fa22`, the static launcher
+module unload fix) is **sufficient on its own** to resolve the crash.
+The full `workload_v4.py` workload with `EXHAUSTIVE` autotuning completes
+successfully with Patch 2 alone, with **no errors** in the log. Adding
+Patch 1 (gc.collect) on top of Patch 2 also passes, but is not required.
+
+The reason Patch 2 alone works comes down to **which code path actually
+causes the fatal crash**:
+
+1. **Autotuning benchmarks** (Triton `CompiledKernel` path) generate the
+   **bulk** of the module churn — ~145 kernel variants per GEMM, ~144 of
+   which become garbage each round. However, Triton PR #9444 already added
+   `CompiledKernel.__del__` with `hipModuleUnload`. Even though Python's GC
+   doesn't run frequently enough to keep the module table completely clean,
+   the GC **does** eventually run between compilation cycles, reclaiming
+   enough modules to stay below the driver's limit. Autotuning errors from
+   temporary table pressure are caught by Inductor ("Ignoring this choice")
+   and are non-fatal.
+
+2. **Winner kernel loading** (`StaticallyLaunchedTritonKernel` path) loads
+   far fewer modules (~50 per compilation cycle), but **before Patch 2,
+   these modules were never unloaded**. The C++ `loadKernel()` function
+   discarded the `CUmodule` handle, making cleanup impossible. Over 7+
+   compilation cycles, these permanently leaked modules accumulated on top
+   of whatever temporary pressure existed from autotuning. When the
+   combined total exceeded the HIP driver's module table capacity, the
+   **next winner kernel load** failed fatally — this was the crash point
+   observed in the v2 test (`static_triton_launcher.py:144`).
+
+Patch 2 fixes this by:
+- Returning the `CUmodule` handle from `loadKernel()` back to Python
+- Storing it on `StaticallyLaunchedTritonKernel.module`
+- Adding `__del__` to call `hipModuleUnload`/`cuModuleUnload` when the
+  kernel object is garbage-collected (e.g., when a new compilation cycle
+  replaces the old compiled graph)
+
+With Patch 2, winner kernel modules from previous compilation cycles are
+properly unloaded when they become unreachable. This keeps the persistent
+module count low enough that even without explicit `gc.collect()` calls in
+the autotuning path, the HIP driver's module table never fills up.
+
+```bash
+# v2 test (crashed at [0/7]):
+rm -rf /tmp/torchinductor_root
+HIP_VISIBLE_DEVICES=7 TRITON_HIP_USE_ASYNC_COPY=0 \
+  TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE=EXHAUSTIVE \
+  python workload_v4.py --compile --inductor --no-cudagraphs --dtypes bfloat16
+```
+
+Log: `test_patch_v2.log`
+
+```bash
+# Patch 2 verification (passed — run via run_autotune_launcher_patch.sh):
+rm -rf /tmp/torchinductor_root
+HIP_VISIBLE_DEVICES=6 TRITON_HIP_USE_ASYNC_COPY=0 \
+  TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE=EXHAUSTIVE \
+  python workload_v4.py --compile --inductor --no-cudagraphs --dtypes bfloat16
+```
+
+Log: `test_with_launcher_patched.log`
+
+**Verification protocol:** The full workload was run twice with Patch 2
+compiled into PyTorch — once with Patch 1 (gc.collect) also applied, and
+once without. Both runs completed with zero errors, confirming Patch 2
+alone is sufficient.
 
 Note: `COMPILE_THREADS=4` also showed a race condition in Triton's
 compilation cache (`FileNotFoundError` on `.source` files and
@@ -313,13 +477,14 @@ This is a different crash path from the module exhaustion bug:
   pointwise kernels, because the generated HSACO binary contains instructions
   the GPU doesn't support
 
-**Both `TRITON_HIP_USE_ASYNC_COPY=0` and the `gc.collect()` patch are needed.**
+**Both `TRITON_HIP_USE_ASYNC_COPY=0` and Patch 2 (static launcher module unload) are needed.**
 
 ## Workarounds
 
 | Workaround | Change | Trade-off |
 |---|---|---|
-| **gc.collect() patch** (recommended) | Apply `gc_module_unload.patch` to PyTorch | Adds ~ms of GC overhead per autotuning round; no functional impact |
+| **Static launcher module unload patch** (recommended) | Apply Patch 2 — commit `4406fa22` to PyTorch (requires C++ rebuild) | No runtime overhead; proper resource lifecycle management |
+| PyCodeCache eviction + gc.collect() patch | Apply `gc_module_unload_v2.patch` to PyTorch (Python-only, no rebuild) | Adds ~ms of GC overhead per autotuning round; insufficient alone for full workload |
 | Reduce compile threads | `TORCHINDUCTOR_COMPILE_THREADS=4` | ~2x slower compilation |
 | Drop EXHAUSTIVE search | Remove `TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE` env var | Fewer kernel candidates; may miss optimal kernel |
 | Use `dynamic=True` | `torch.compile(..., dynamic=True)` | Single symbolic compilation; may have guard overhead |
