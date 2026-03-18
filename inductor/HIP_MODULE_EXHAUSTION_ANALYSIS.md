@@ -513,3 +513,192 @@ frozen to FixedLayout(..., size=[32, 16], stride=[1, 32])
 
 This warning is benign and does not cause a crash. It appears at every
 compilation `[0/1]` through `[0/7]` but is not present with small batch sizes.
+
+---
+
+## 2026-03-17 Restart Investigation (PR #9444 only) — In Progress
+
+The investigation was restarted from a baseline with **Triton PR #9444 applied**
+and no additional local fixes.
+
+### Fixed run constraints for restart
+
+- `TRITON_HIP_USE_ASYNC_COPY=0` (kept fixed)
+- `--no-cudagraphs` (kept fixed)
+- `--padded` (kept fixed)
+- `TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE=EXHAUSTIVE` (kept fixed)
+- Added `--dynamic false` to increase recompilation pressure where applicable
+
+### Script used
+
+All tests run through `run_workload.sh`. The script was updated to:
+
+- Accept `STATIC_LAUNCHER` and optional `TORCH_COMPILE_THREADS_VALUE`
+- Keep the required fixed flags/envs above
+- Record periodic CPU memory snapshots to `*.cpu-mem.log`
+- Track Python process peak RSS (`peak_rss_kb`)
+
+### Run A (first pass): static launcher enabled
+
+Command:
+
+```bash
+STATIC_LAUNCHER=1 LOG_PREFIX=restart-investigation-launcher1 bash run_workload.sh
+```
+
+Artifacts:
+
+- `restart-investigation-launcher1.log`
+- `restart-investigation-launcher1.cpu-mem.log`
+
+Result: **FAILED** (reproduced `hipErrorNoBinaryForGpu` / error 209)
+
+Runtime and memory:
+
+- Total elapsed: ~48 minutes (`small` + `medium` completed; failure at start of next compile phase)
+- Peak Python RSS: `14305152` KB (~13.64 GiB)
+- Host memory remained far from exhaustion (hundreds of GB still available)
+
+Observed progression:
+
+- Long compile/autotune phase with exhaustive GEMM search spaces
+- Non-fatal Triton resource rejections first appeared:
+  - `No valid triton configs. OutOfMemoryError: out of resource: triton_mm`
+  - `Required: 196608 Hardware limit: 163840`
+  - Logged as `Ignoring this choice`, run continued
+- Later, repeated runtime autotune errors appeared:
+  - `CUDA driver error: 209`
+  - `CUDA error: no kernel image is available for execution on the device`
+  - `hipErrorNoBinaryForGpu` hint in log
+
+Fatal crash point:
+
+- Exception raised as:
+  - `torch._inductor.exc.InductorError: AcceleratorError: CUDA error: no kernel image is available for execution on the device`
+- Failure surfaced while benchmarking fused Triton nodes (`scheduler.py` -> `triton.py` benchmark path), during `rand_strided(..., device='cuda:0', dtype=torch.bfloat16)` argument creation for a generated autotune module in `/tmp/torchinductor_test/...`.
+
+Notes:
+
+- `run_workload.sh` had a logging-only quoting bug in the `peak_rss_gb` summary line after Run A completed; this was fixed immediately after Run A. It did not affect the workload execution itself.
+
+### Run B (next step): static launcher disabled
+
+Per test plan after reproducing with launcher enabled, the next run uses:
+
+```bash
+STATIC_LAUNCHER=0 LOG_PREFIX=restart-investigation-launcher0 bash run_workload.sh
+```
+
+Artifacts:
+
+- `restart-investigation-launcher0.log`
+- `restart-investigation-launcher0.cpu-mem.log`
+
+Result so far: **NO hipErrorNoBinaryForGpu observed in equivalent window**
+
+- Ran past the launcher=1 failure window (~48 min) without `CUDA error: no kernel image`
+- Continued through heavy large-network autotune phases with no 209/no-kernel-image errors
+- CPU RSS rose significantly over time:
+  - ~14.6 GiB at ~42 min
+  - ~24.8 GiB peak (`peak_rss_kb_so_far=25973596`) at ~56 min
+- Host memory still had large headroom (no host OOM pressure)
+
+Run B was manually stopped after collecting comparison evidence (to proceed to the
+`TORCH_COMPILE_THREADS=1` launcher=1 run requested in the test plan).
+
+### Run C (requested): launcher enabled + single compile thread
+
+Command:
+
+```bash
+STATIC_LAUNCHER=1 TORCH_COMPILE_THREADS_VALUE=1 \
+  LOG_PREFIX=restart-investigation-launcher1-threads1 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `restart-investigation-launcher1-threads1.log`
+- `restart-investigation-launcher1-threads1.cpu-mem.log`
+
+Result: **FAILED** (reproduced `hipErrorNoBinaryForGpu` / error 209)
+
+Runtime and memory:
+
+- Total elapsed: ~48 minutes (`exit_code=1`)
+- Peak Python RSS: `14279332` KB (`peak_rss_gb=13.618`)
+- Host memory remained far from exhaustion
+
+Observed progression:
+
+- `small` network compiled/trained, then `medium` completed
+  (`(torch.bfloat16, medium)` timing lines present)
+- Same warning pattern seen before fatal failure:
+  - `No valid triton configs. OutOfMemoryError: out of resource: triton_mm`
+  - `Required: 196608 Hardware limit: 163840`
+  - Logged as `Ignoring this choice`
+- Then repeated runtime autotune errors:
+  - `CUDA driver error: 209`
+  - `CUDA error: no kernel image is available for execution on the device`
+
+Fatal crash point:
+
+- `torch._inductor.exc.InductorError: AcceleratorError: CUDA error: no kernel image is available for execution on the device`
+- Raised in autotune input generation path while creating benchmark tensors
+  (`select_algorithm.py` -> `rand_strided` -> `torch.randn`)
+
+Conclusion from Run C:
+
+- Setting `TORCH_COMPILE_THREADS=1` did **not** prevent the failure.
+- Failure mode remains consistent with launcher=1 runs.
+
+### Run D (requested follow-up): static launcher disabled to completion
+
+Per latest request, rerun with static launcher disabled and allow it to run until
+natural completion (no manual stop), while tracking CPU memory throughout.
+
+Command:
+
+```bash
+STATIC_LAUNCHER=0 LOG_PREFIX=restart-investigation-launcher0-complete bash run_workload.sh
+```
+
+Artifacts:
+
+- `restart-investigation-launcher0-complete.log`
+- `restart-investigation-launcher0-complete.cpu-mem.log`
+
+Result: **FAILED** (reproduced `hipErrorNoBinaryForGpu` / error 209)
+
+Runtime and memory:
+
+- Total elapsed: ~79.8 minutes (`elapsed_ms=4788067`, `exit_code=1`)
+- Peak Python RSS: `27010140` KB (`peak_rss_gb=25.759`)
+- Host memory remained far from exhaustion (large free memory headroom)
+
+Observed progression:
+
+- Run advanced much farther than the earlier launcher=0 comparison run
+  (which had been manually stopped at ~56 minutes).
+- Non-fatal autotune warnings persisted during search:
+  - `OutOfResources: out of resource: shared memory, Required: 196608, Hardware limit: 163840`
+  - Logged as `Ignoring this choice`
+- Near failure window (`~00:47:45`), repeated autotune runtime errors appeared:
+  - `Triton Error [HIP]: Code: 209, Messsage: no kernel image is available for execution on the device`
+  - `CUDA error: no kernel image is available for execution on the device`
+  - `hipErrorNoBinaryForGpu`
+
+Fatal crash point:
+
+- Final exception:
+  `torch._inductor.exc.InductorError: AcceleratorError: CUDA error: no kernel image is available for execution on the device`
+- Raised during autotune input generation (`select_algorithm.py` ->
+  `benchmark_example_value` -> `rand_strided` -> `torch.randn`), while compiling
+  backward graph.
+
+Conclusion from Run D:
+
+- Disabling static launcher (`STATIC_LAUNCHER=0`) does **not** eliminate the
+  failure under longer runtime with `--dynamic false`.
+- It appears to delay onset relative to launcher=1 runs, but the same terminal
+  error still occurs eventually.
