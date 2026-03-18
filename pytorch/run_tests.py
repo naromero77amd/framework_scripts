@@ -17,6 +17,32 @@ from pathlib import Path
 TEST_FILE_REL_PATH = 'test/inductor/test_torchinductor.py'
 
 
+def _require_rocm_home():
+    """
+    Return ROCM_HOME from the user environment.
+    Raise RuntimeError if unset/empty because inductor tests require it.
+    """
+    rocm_home = (subprocess.os.environ.get('ROCM_HOME') or '').strip()
+    if not rocm_home:
+        raise RuntimeError(
+            "ROCM_HOME environment variable must be set to some value in your environment, "
+            "or Inductor unit tests will fail."
+        )
+    return rocm_home
+
+
+def _build_test_env():
+    """Build subprocess environment for inductor tests."""
+    env = {
+        **subprocess.os.environ.copy(),
+        'PYTORCH_TEST_WITH_ROCM': '1',
+        'HSA_FORCE_FINE_GRAIN_PCIE': '1',
+        'PYTORCH_TESTING_DEVICE_ONLY_FOR': 'cuda',
+    }
+    env['ROCM_HOME'] = _require_rocm_home()
+    return env
+
+
 def ensure_pytest_and_timeout_installed():
     """
     Verify that pytest, pytest-timeout, and expecttest are installed (same interpreter as this script).
@@ -114,12 +140,7 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         # CSV: run pytest with -k (keyword match) and per-test timeout.
         cmd = ['pytest', TEST_FILE_REL_PATH, '-k', test_name, '--timeout', str(timeout)]
 
-    env = {
-        **subprocess.os.environ.copy(),
-        'PYTORCH_TEST_WITH_ROCM': '1',
-        'HSA_FORCE_FINE_GRAIN_PCIE': '1',
-        'PYTORCH_TESTING_DEVICE_ONLY_FOR': 'cuda',
-    }
+    env = _build_test_env()
     
     header = f"\n{'='*70}\nRunning: {test_name}\n{'='*70}\n"
     print(header, end='')
@@ -239,12 +260,7 @@ def _run_collect_only_and_parse(pytorch_path, cmd):
     Uses the same env as discover_tests/run_test for consistency.
     Returns (total: int, breakdown: dict[str, int]). On failure or parse error, returns (0, {}).
     """
-    env = {
-        **subprocess.os.environ.copy(),
-        'PYTORCH_TEST_WITH_ROCM': '1',
-        'HSA_FORCE_FINE_GRAIN_PCIE': '1',
-        'PYTORCH_TESTING_DEVICE_ONLY_FOR': 'cuda',
-    }
+    env = _build_test_env()
     try:
         result = subprocess.run(
             cmd,
@@ -322,12 +338,7 @@ def discover_tests(pytorch_path, log_file, test_file_rel_paths=None):
         test_file_rel_paths = [TEST_FILE_REL_PATH]
     test_paths = [str(Path(pytorch_path) / p) for p in test_file_rel_paths]
     cmd = ['pytest'] + test_paths + ['--collect-only', '-q']
-    env = {
-        **subprocess.os.environ.copy(),
-        'PYTORCH_TEST_WITH_ROCM': '1',
-        'HSA_FORCE_FINE_GRAIN_PCIE': '1',
-        'PYTORCH_TESTING_DEVICE_ONLY_FOR': 'cuda',
-    }
+    env = _build_test_env()
     try:
         result = subprocess.run(
             cmd,
@@ -754,6 +765,14 @@ def main():
         sys.exit(1)
     if args.regex and not args.all_tests:
         print("Warning: --regex only applies to full-suite mode (--all-tests); ignoring --regex.\n")
+
+    # Inductor ROCm tests require ROCM_HOME to be set in the user environment.
+    try:
+        _require_rocm_home()
+    except RuntimeError as e:
+        print(f"Error: {e}")
+        print("Example: export ROCM_HOME=/opt/rocm")
+        sys.exit(1)
     
     # Generate log file name if not provided (only used when not --collect-only)
     if args.log_file is None:
