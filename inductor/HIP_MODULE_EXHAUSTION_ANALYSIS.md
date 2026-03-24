@@ -454,30 +454,30 @@ compilation cache (`FileNotFoundError` on `.source` files and
 
 ## Environment Notes
 
-### `TRITON_HIP_USE_ASYNC_COPY=0` — REQUIRED
+### `TRITON_HIP_USE_ASYNC_COPY` — historical requirement, now conditional
 
-This variable **must** be set. It addresses a **separate issue** from module
-exhaustion: without it, Triton emits async copy instructions that are
-incompatible with gfx950, producing binaries that fail with the same
-error 209 but through a different code path.
+Historical baseline evidence showed a separate non-module-exhaustion failure
+mode when async copy was enabled on gfx950. In that baseline, omitting
+`TRITON_HIP_USE_ASYNC_COPY=0` could crash during coordinate-descent tuning of
+pointwise kernels with the same driver error code (`209`) but a different path.
 
-Tested: running `repro_bug2_gc.py` (with `gc.collect()`) but **without**
-`TRITON_HIP_USE_ASYNC_COPY=0` still crashes at `[0/7]`:
+However, the latest matrix with the current patch stack revalidated this
+assumption and produced a different outcome (see Runs V/W below):
 
-```
-iter 6: B=713 (compilation [0/7] expected)
-  → coordinate_descent_tuner.py → _precompile_config → make_launcher → load_kernel
-  → triton_poi_fused__to_copy_17   ← pointwise kernel, NOT a GEMM
-  RuntimeError: CUDA driver error: 209
-```
+- `TRITON_HIP_USE_ASYNC_COPY` explicitly **unset**
+- Static launcher unload fix present (PR #176988 / commit `4406fa22`)
+- Python v3 benchmark-module cleanup present (`select_algorithm.py`)
+- `waves_per_eu=0` forced in ROCm GEMM heuristics
+- `WORKLOAD_NETWORKS="large extralarge"`
+- Both `STATIC_LAUNCHER=1` and `STATIC_LAUNCHER=0` passed to completion
+  with no `209`/`no kernel image` failures.
 
-This is a different crash path from the module exhaustion bug:
-- **Module exhaustion** (Bug 2): crash during GEMM autotuning benchmark setup
-- **Async copy incompatibility**: crash during coordinate descent tuning of
-  pointwise kernels, because the generated HSACO binary contains instructions
-  the GPU doesn't support
+Current conclusion:
 
-**Both `TRITON_HIP_USE_ASYNC_COPY=0` and Patch 2 (static launcher module unload) are needed.**
+- For the **current patched stack and reproducer**, forcing
+  `TRITON_HIP_USE_ASYNC_COPY=0` is **not required**.
+- Keep it as a troubleshooting knob for older baselines or different kernels /
+  workloads where async-copy instruction compatibility may still regress.
 
 ## Workarounds
 
@@ -702,3 +702,880 @@ Conclusion from Run D:
   failure under longer runtime with `--dynamic false`.
 - It appears to delay onset relative to launcher=1 runs, but the same terminal
   error still occurs eventually.
+
+### Run E (narrowing): `--networks large extralarge`, static launcher enabled
+
+Per narrowing request, rerun with only `large` and `extralarge` networks while
+keeping all fixed constraints.
+
+Command:
+
+```bash
+STATIC_LAUNCHER=1 WORKLOAD_NETWORKS="large extralarge" \
+  LOG_PREFIX=narrow-large-extralarge-launcher1 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `narrow-large-extralarge-launcher1.log`
+- `narrow-large-extralarge-launcher1.cpu-mem.log`
+
+Result: **FAILED** (reproduced `hipErrorNoBinaryForGpu` / error 209)
+
+Runtime and memory:
+
+- Total elapsed: ~41.6 minutes (`elapsed_ms=2498300`, `exit_code=1`)
+- Peak Python RSS: `15656908` KB (`peak_rss_gb=14.932`)
+- Host memory remained far from exhaustion
+
+Observed progression:
+
+- `large` completed its timing iterations successfully.
+- During subsequent compile/autotune work, the run failed with:
+  - `CUDA error: no kernel image is available for execution on the device`
+  - `hipErrorNoBinaryForGpu`
+
+Fatal crash point:
+
+- Trace terminates in:
+  - `torch.AcceleratorError: CUDA error: no kernel image is available for execution on the device`
+
+### Run F (narrowing): `--networks large extralarge`, static launcher disabled
+
+Follow-up run with static launcher disabled under the same narrowed network set.
+
+Command:
+
+```bash
+STATIC_LAUNCHER=0 WORKLOAD_NETWORKS="large extralarge" \
+  LOG_PREFIX=narrow-large-extralarge-launcher0 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `narrow-large-extralarge-launcher0.log`
+- `narrow-large-extralarge-launcher0.cpu-mem.log`
+
+Result: **FAILED** (reproduced `hipErrorNoBinaryForGpu` / error 209)
+
+Runtime and memory:
+
+- Total elapsed: ~51.1 minutes (`elapsed_ms=3066823`, `exit_code=1`)
+- Peak Python RSS: `33476464` KB (`peak_rss_gb=31.926`)
+- Host memory remained far from exhaustion
+
+Observed progression:
+
+- Repeated autotune-time runtime failures appeared first:
+  - `Triton Error [HIP]: Code: 209, Messsage: no kernel image is available for execution on the device`
+  - `CUDA error: no kernel image is available for execution on the device`
+  - `hipErrorNoBinaryForGpu`
+- These were followed by a fatal inductor exception.
+
+Fatal crash point:
+
+- Final exception:
+  - `torch._inductor.exc.InductorError: AcceleratorError: CUDA error: no kernel image is available for execution on the device`
+
+Conclusion from Runs E/F:
+
+- Narrowing to `large + extralarge` is sufficient to reproduce the failure for
+  **both** `STATIC_LAUNCHER=1` and `STATIC_LAUNCHER=0`.
+- `STATIC_LAUNCHER=0` again delays failure but does not eliminate it, and
+  reached a much higher peak CPU RSS in this narrowed setup.
+
+### Run G (narrowing): `--networks extralarge`, static launcher enabled
+
+Next narrowing step with only `extralarge` under launcher enabled.
+
+Command:
+
+```bash
+STATIC_LAUNCHER=1 WORKLOAD_NETWORKS="extralarge" \
+  LOG_PREFIX=narrow-extralarge-launcher1 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `narrow-extralarge-launcher1.log`
+- `narrow-extralarge-launcher1.cpu-mem.log`
+
+Result: **FAILED**
+
+Runtime and memory:
+
+- Total elapsed: ~25.0 minutes (`elapsed_ms=1499015`, `exit_code=1`)
+- Peak Python RSS: `12380332` KB (`peak_rss_gb=11.807`)
+- Host memory remained far from exhaustion
+
+Observed progression:
+
+- Repeated autotune-time runtime failures appeared:
+  - `CUDA driver error: 209`
+  - `CUDA error: no kernel image is available for execution on the device`
+  - `hipErrorNoBinaryForGpu`
+- After the 209/no-kernel-image phase, additional runtime errors appeared:
+  - `CUDA driver error: 1`
+  - `CUDA error: invalid argument` (`hipErrorInvalidValue`)
+
+Fatal crash point:
+
+- Final exception:
+  - `torch._inductor.exc.InductorError: AcceleratorError: CUDA error: invalid argument`
+- Raised during autotune benchmark argument creation
+  (`torch/_dynamo/testing.py::rand_strided` -> `torch.randn`) while benchmarking
+  fused Triton nodes.
+
+Interpretation:
+
+- `extralarge` alone is sufficient to trigger the same instability with launcher
+  enabled, including explicit 209/no-kernel-image errors before terminal failure.
+
+### Run H (narrowing): `--networks extralarge`, static launcher disabled
+
+Follow-up run with launcher disabled on `extralarge` only.
+
+Command:
+
+```bash
+STATIC_LAUNCHER=0 WORKLOAD_NETWORKS="extralarge" \
+  LOG_PREFIX=narrow-extralarge-launcher0 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `narrow-extralarge-launcher0.log`
+- `narrow-extralarge-launcher0.cpu-mem.log`
+
+Result: **PASSED** (no `hipErrorNoBinaryForGpu`, no traceback)
+
+Runtime and memory:
+
+- Total elapsed: ~32.9 minutes (`elapsed_ms=1975349`, `exit_code=0`)
+- Peak Python RSS: `26180828` KB (`peak_rss_gb=24.968`)
+- Host memory remained far from exhaustion
+
+Observed progression:
+
+- Run completed and printed final results table:
+  - `extralarge bfloat16 median = 0.049732 s`
+- Non-fatal autotune pruning warnings were still present:
+  - `OutOfResources: out of resource: shared memory ... Ignoring this choice`
+- No `CUDA driver error: 209`, no `no kernel image`, and no
+  `InductorError` were observed in this run.
+
+Conclusion from Runs G/H (`extralarge` only):
+
+- `STATIC_LAUNCHER=1`: **FAILED** with explicit 209/no-kernel-image before
+  terminal failure.
+- `STATIC_LAUNCHER=0`: **PASSED** to completion in this run.
+- This creates a sharper split for `extralarge`-only than for
+  `large+extralarge`, where both launcher settings failed.
+
+### Run I (further isolation): `--networks large`, static launcher enabled
+
+After confirming `extralarge` split behavior, run `large` only with launcher
+enabled.
+
+Command:
+
+```bash
+STATIC_LAUNCHER=1 WORKLOAD_NETWORKS="large" \
+  LOG_PREFIX=narrow-large-launcher1 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `narrow-large-launcher1.log`
+- `narrow-large-launcher1.cpu-mem.log`
+
+Result: **FAILED** (reproduced `hipErrorNoBinaryForGpu` / no-kernel-image)
+
+Runtime and memory:
+
+- Total elapsed: ~42.2 minutes (`elapsed_ms=2529696`, `exit_code=1`)
+- Peak Python RSS: `15673640` KB (`peak_rss_gb=14.948`)
+- Host memory remained far from exhaustion
+
+Observed progression:
+
+- Long autotune/compile phase ran for ~40+ minutes before failure.
+- Near the failure window, traceback terminates with:
+  - `torch.AcceleratorError: CUDA error: no kernel image is available for execution on the device`
+  - `hipErrorNoBinaryForGpu`
+
+Conclusion from Run I:
+
+- `large` alone is sufficient to reproduce the no-kernel-image failure with
+  launcher enabled.
+
+### Run J (further isolation): `--networks large`, static launcher disabled
+
+Companion run completed with launcher disabled.
+
+Command:
+
+```bash
+STATIC_LAUNCHER=0 WORKLOAD_NETWORKS="large" \
+  LOG_PREFIX=narrow-large-launcher0 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `narrow-large-launcher0.log`
+- `narrow-large-launcher0.cpu-mem.log`
+
+Result: **PASSED** (no `hipErrorNoBinaryForGpu`, no traceback)
+
+Runtime and memory:
+
+- Total elapsed: ~42.3 minutes (`elapsed_ms=2535809`, `exit_code=0`)
+- Peak Python RSS: `21403744` KB (`peak_rss_gb=20.412`)
+- Host memory remained far from exhaustion
+
+Observed progression:
+
+- Run crossed the launcher=1 failure window (~42.2 min) and completed normally.
+- Final results table was printed:
+  - `large bfloat16 median = 0.037159 s`
+- Non-fatal autotune pruning warnings still appeared:
+  - `OutOfResources: out of resource: shared memory ... Ignoring this choice`
+- No `CUDA driver error: 209`, no `no kernel image`, and no
+  `InductorError` were observed.
+
+Conclusion from Runs I/J (`large` only):
+
+- `STATIC_LAUNCHER=1`: **FAILED** with no-kernel-image (`hipErrorNoBinaryForGpu`)
+- `STATIC_LAUNCHER=0`: **PASSED** to completion in this run.
+
+### Run K (order sensitivity): `--networks extralarge large`, static launcher disabled
+
+To test whether the launcher=0 failure on multi-network runs depends on network
+ordering, rerun with reversed order.
+
+Command:
+
+```bash
+STATIC_LAUNCHER=0 WORKLOAD_NETWORKS="extralarge large" \
+  LOG_PREFIX=narrow-extralarge-large-launcher0 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `narrow-extralarge-large-launcher0.log`
+- `narrow-extralarge-large-launcher0.cpu-mem.log`
+
+Result: **FAILED** (reproduced `hipErrorNoBinaryForGpu` / no-kernel-image)
+
+Runtime and memory:
+
+- Total elapsed: ~35.6 minutes (`elapsed_ms=2135214`, `exit_code=1`)
+- Peak Python RSS: `28564076` KB (`peak_rss_gb=27.241`)
+- Host memory remained far from exhaustion
+
+Observed progression:
+
+- `extralarge` completed its timing loop first:
+  - `(torch.bfloat16, extralarge) took 0.04939..0.05098 s`
+- During the subsequent compile/autotune phase (`[0/1]`), repeated runtime
+  errors appeared:
+  - `Triton Error [HIP]: Code: 209, Messsage: no kernel image is available for execution on the device`
+  - `CUDA error: no kernel image is available for execution on the device`
+  - `hipErrorNoBinaryForGpu`
+- Final exception:
+  - `torch._inductor.exc.InductorError: AcceleratorError: CUDA error: no kernel image is available for execution on the device`
+  - Raised while creating autotune benchmark arguments (`rand_strided` ->
+    `torch.randn`) for a generated module in `/tmp/torchinductor_test/...`.
+
+Conclusion from launcher=0 multi-network runs:
+
+- `large + extralarge` (`Run F`): **FAILED**
+- `extralarge + large` (`Run K`): **FAILED**
+- Failure occurs in both orders under launcher=0; reversing order changed
+  time-to-failure (Run K failed earlier than Run F), but did not eliminate the
+  no-kernel-image failure.
+
+### Run L (launcher=0 + single compile thread): `--networks extralarge large`
+
+To test whether compile concurrency changes the launcher=0 multi-network
+failure mode, rerun Run K with `TORCH_COMPILE_THREADS=1`.
+
+Command:
+
+```bash
+STATIC_LAUNCHER=0 TORCH_COMPILE_THREADS_VALUE=1 \
+  WORKLOAD_NETWORKS="extralarge large" \
+  LOG_PREFIX=narrow-extralarge-large-launcher0-threads1 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `narrow-extralarge-large-launcher0-threads1.log`
+- `narrow-extralarge-large-launcher0-threads1.cpu-mem.log`
+
+Result: **FAILED**
+
+Runtime and memory:
+
+- Total elapsed: ~35.8 minutes (`elapsed_ms=2147718`, `exit_code=1`)
+- Peak Python RSS: `28544076` KB (`peak_rss_gb=27.222`)
+- Host memory remained far from exhaustion
+
+Observed progression:
+
+- Repeated autotune runtime errors appeared at `[0/1]`:
+  - `Triton Error [HIP]: Code: 209, Messsage: no kernel image is available for execution on the device`
+  - `CUDA error: no kernel image is available for execution on the device`
+  - `hipErrorNoBinaryForGpu`
+- `extralarge` timing iterations still completed first:
+  - `(torch.bfloat16, extralarge) took 0.04942..0.05150 s`
+- Terminal exception in this run was:
+  - `torch._inductor.exc.InductorError: MemoryError`
+  - Raised from `torch/_inductor/codecache.py::update_local_cache` during
+    `json.dumps({"system": self.system, "cache": local_cache}, indent=4)`.
+
+Conclusion from Runs K/L (`extralarge + large`, launcher=0):
+
+- `TORCH_COMPILE_THREADS` default (Run K): **FAILED** with terminal
+  no-kernel-image `InductorError`.
+- `TORCH_COMPILE_THREADS=1` (Run L): **FAILED** with terminal `MemoryError`,
+  but only after the same repeated `209/no-kernel-image` sequence.
+- Lowering compile threads did not prevent the launcher=0 multi-network failure
+  and did not materially change time-to-failure or peak RSS in this setup.
+
+### Run M (launcher=0 + single compile thread): `--networks large extralarge`
+
+Symmetric check for compile-thread impact with original network order
+(`large` then `extralarge`).
+
+Command:
+
+```bash
+STATIC_LAUNCHER=0 TORCH_COMPILE_THREADS_VALUE=1 \
+  WORKLOAD_NETWORKS="large extralarge" \
+  LOG_PREFIX=narrow-large-extralarge-launcher0-threads1 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `narrow-large-extralarge-launcher0-threads1.log`
+- `narrow-large-extralarge-launcher0-threads1.cpu-mem.log`
+
+Result: **FAILED** (reproduced `hipErrorNoBinaryForGpu` / no-kernel-image)
+
+Runtime and memory:
+
+- Total elapsed: ~51.5 minutes (`elapsed_ms=3088589`, `exit_code=1`)
+- Peak Python RSS: `33483064` KB (`peak_rss_gb=31.932`)
+- Host memory remained far from exhaustion
+
+Observed progression:
+
+- `large` timing iterations completed first:
+  - `(torch.bfloat16, large) took 0.03695..0.03699 s`
+- During subsequent compile/autotune work (`[0/1]`), repeated runtime errors
+  appeared:
+  - `Triton Error [HIP]: Code: 209, Messsage: no kernel image is available for execution on the device`
+  - `CUDA error: no kernel image is available for execution on the device`
+  - `hipErrorNoBinaryForGpu`
+- Final exception:
+  - `torch._inductor.exc.InductorError: AcceleratorError: CUDA error: no kernel image is available for execution on the device`
+  - Raised in backward compile/autotune path while creating benchmark tensors
+    (`rand_strided((960000, 256), ...)` -> `torch.randn`).
+
+Conclusion from Runs F/M (`large + extralarge`, launcher=0):
+
+- `TORCH_COMPILE_THREADS` default (Run F): **FAILED**
+- `TORCH_COMPILE_THREADS=1` (Run M): **FAILED**
+- Lowering compile threads did not prevent launcher=0 failure for this
+  multi-network order, and produced similar time-to-failure / peak RSS.
+
+### Run N (cumulative-control): `--networks large large`, launcher disabled
+
+To test whether launcher=0 failures are caused by simply running two large
+iterations in one process (vs. running two different large models), rerun with
+the same network repeated.
+
+Command:
+
+```bash
+STATIC_LAUNCHER=0 WORKLOAD_NETWORKS="large large" \
+  LOG_PREFIX=narrow-large-large-launcher0 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `narrow-large-large-launcher0.log`
+- `narrow-large-large-launcher0.cpu-mem.log`
+
+Result: **PASSED** (`exit_code=0`)
+
+Runtime and memory:
+
+- Total elapsed: ~42.0 minutes (`elapsed_ms=2520108`)
+- Peak Python RSS: `21428556` KB (`peak_rss_gb=20.436`)
+- Host memory remained far from exhaustion
+
+Observed progression:
+
+- Both `large` entries completed and final results table was printed:
+  - `large 2400000 0.037183`
+  - `large 2400000 0.037183`
+- No `CUDA driver error: 209`, no `no kernel image`, and no
+  `InductorError` were observed.
+- RSS stayed comparatively modest through most of the run, with a late jump to
+  ~21.4 GiB near completion.
+
+Conclusion from Run N:
+
+- Repeating the same `large` network twice under launcher=0 did **not**
+  reproduce the failure.
+- Current evidence points more strongly to cross-network compile churn from
+  `large + extralarge` (in either order), rather than merely executing two
+  `large` passes in one process.
+
+### Run O (cumulative-control): `--networks extralarge extralarge`, launcher disabled
+
+To mirror Run N with the other suspected network, repeat `extralarge` twice
+under launcher=0.
+
+Command:
+
+```bash
+STATIC_LAUNCHER=0 WORKLOAD_NETWORKS="extralarge extralarge" \
+  LOG_PREFIX=narrow-extralarge-extralarge-launcher0 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `narrow-extralarge-extralarge-launcher0.log`
+- `narrow-extralarge-extralarge-launcher0.cpu-mem.log`
+
+Result: **PASSED** (`exit_code=0`)
+
+Runtime and memory:
+
+- Total elapsed: ~32.3 minutes (`elapsed_ms=1935350`)
+- Peak Python RSS: `26177632` KB (`peak_rss_gb=24.965`)
+
+Observed progression:
+
+- Final results table printed both repeated entries:
+  - `extralarge 960000 0.049433`
+  - `extralarge 960000 0.049433`
+- No `CUDA driver error: 209`, no `no kernel image`, and no
+  `InductorError` were observed.
+- Peak RSS is nearly identical to prior launcher=0 single-`extralarge`
+  passing run (Run H: ~24.968 GiB), rather than increasing toward mixed-network
+  failure peaks.
+
+Conclusion from Run O:
+
+- Repeating `extralarge` alone twice under launcher=0 did **not** reproduce the
+  failure.
+- Together with Run N (`large large` pass), this strengthens the hypothesis
+  that launcher=0 failures are tied to **mixed-network compile churn**
+  (`large` + `extralarge` in one process), not simple same-network repetition.
+- Caveat: repeated identical networks likely benefit from compile/cache reuse,
+  so they may not stress the same path as mixed-network runs.
+
+## Code-path drilldown for launcher=0 failures
+
+This section focuses on why `STATIC_LAUNCHER=0` can still fail with
+`hipErrorNoBinaryForGpu` even with Triton explicit unload support from PR #928.
+
+### What the failure stack says
+
+Across launcher=0 mixed-network failures (Runs F/K/M), the terminal traceback is
+consistently in Inductor autotune/benchmark compilation, not in steady-state
+model execution:
+
+- `scheduler.py` fusion benchmarking
+- `codegen/triton.py::benchmark_codegened_module`
+- generated module `get_args()` -> `rand_strided(...)` -> `torch.randn(...)`
+
+This indicates an already-corrupted GPU module load state by the time benchmark
+argument generation runs, after repeated autotune runtime `209/no kernel image`
+errors.
+
+### Why PR #928 may be insufficient in this path
+
+PR #928 behavior (present in this environment):
+
+- `triton.compiler.CompiledKernel.__del__` unloads module via
+  `driver.active.utils.unload_module(self.module)`.
+
+However, in the Inductor runtime path used by launcher=0:
+
+1. `CachingAutotuner._make_launchers()` builds launchers for **all**
+   precompiled configs (often hundreds to >1000 per kernel with EXHAUSTIVE).
+2. Each `TritonCompileResult.make_launcher()` places the compiled binary in
+   launcher scope (`scope["bin"] = binary`) and calls `binary._init_handles()`,
+   which loads the GPU module.
+3. `autotune_to_one_config()` narrows `self.launchers` to one winner, but
+   `self.compile_results` remains populated with all compiled candidates.
+4. `PyCodeCache` keeps loaded Python modules strongly referenced in
+   `PyCodeCache.modules`, and those modules keep `CachingAutotuner` instances
+   alive.
+
+Net effect:
+
+- `CompiledKernel` objects often stay live for long process lifetimes.
+- `CompiledKernel.__del__` is not called promptly, so module unload does not
+  happen fast enough to prevent cumulative module-table growth.
+
+### Why this matches observed behavior
+
+- Single-network launcher=0 passes (`large`, `extralarge`, `large large`,
+  `extralarge extralarge`) imply reuse/caching can stay below failure threshold.
+- Mixed-network launcher=0 failures (`large + extralarge`, either order) imply
+  additional unique compile/autotune churn pushes process lifetime module count
+  over threshold.
+- `TORCH_COMPILE_THREADS=1` does not fix this because the issue appears tied to
+  object/module lifetime retention, not compile-thread concurrency.
+
+### Separate static-launcher note
+
+Current `torch/_inductor/runtime/static_triton_launcher.py` in this tree does
+not currently expose a Python-side destructor unloading path, and static
+launcher C++ bindings here expose `_load_kernel` / `_launch_kernel` but no
+companion unload entrypoint. This is consistent with launcher=1 failing faster,
+but distinct from the launcher=0 analysis above.
+
+## 2026-03-19 Matrix: minimal-invasive sequence (in progress)
+
+Per latest plan, the sequence is:
+
+1. Test autotune subprocess mode with no local patch.
+2. Disable autotune subprocess and add code patches incrementally (`v1` -> `v2` -> `v3`) until pass.
+3. For each passing config from (1)/(2), retest with `STATIC_LAUNCHER=1`.
+
+Updated objective:
+
+- Find at least one configuration that passes with both `STATIC_LAUNCHER=0` and
+  `STATIC_LAUNCHER=1`.
+- Prefer a non-subprocess configuration (lower overhead).
+- If no patch-based non-subprocess config succeeds, run no-patch/no-subprocess
+  diagnostics with `AMD_LOG_LEVEL=3`.
+
+### Run P (step 1): subprocess autotune, no local patch
+
+Command:
+
+```bash
+STATIC_LAUNCHER=0 WORKLOAD_NETWORKS="large extralarge" \
+  TORCHINDUCTOR_RELEASE_UNUSED_TRITON_KERNELS=0 \
+  TORCHINDUCTOR_RELEASE_UNUSED_TRITON_KERNELS_GC=0 \
+  TORCHINDUCTOR_AUTOTUNE_IN_SUBPROC=1 \
+  LOG_PREFIX=matrix-subproc1-release0-launcher0 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `matrix-subproc1-release0-launcher0.log`
+- `matrix-subproc1-release0-launcher0.cpu-mem.log`
+
+Result: **PASSED** (`exit_code=0`)
+
+Runtime and memory:
+
+- Total elapsed: ~75.96 minutes (`elapsed_ms=4557799`)
+- Peak Python RSS: `19503604` KB (`peak_rss_gb=18.600`)
+
+Observed behavior:
+
+- No `CUDA driver error: 209`
+- No `CUDA error: no kernel image is available for execution on the device`
+- No `hipErrorNoBinaryForGpu`
+- No traceback
+- Final timing lines printed for both requested networks:
+  - `(torch.bfloat16, large)` timing block present
+  - `(torch.bfloat16, extralarge)` timing block present
+
+Interpretation:
+
+- Autotune subprocess mode alone is a strong candidate for a minimally invasive mitigation for the launcher=0 mixed-network failure mode.
+- Trade-off is substantially longer compile/autotune wall clock (expected from subprocess benchmarking and process handoff overhead).
+
+### Run Q (step 2 start): no subprocess + patch v1 (`gc.collect()` only)
+
+Patch applied:
+
+- `gc_module_unload.patch` semantics in
+  `torch/_inductor/select_algorithm.py`:
+  - `import gc`
+  - after `result = benchmark_fn(choices)`, call `gc.collect()`
+
+Command:
+
+```bash
+STATIC_LAUNCHER=0 WORKLOAD_NETWORKS="large extralarge" \
+  TORCHINDUCTOR_RELEASE_UNUSED_TRITON_KERNELS=0 \
+  TORCHINDUCTOR_RELEASE_UNUSED_TRITON_KERNELS_GC=0 \
+  TORCHINDUCTOR_AUTOTUNE_IN_SUBPROC=0 \
+  LOG_PREFIX=matrix-nosubproc-v1-launcher0 \
+  bash run_workload.sh
+```
+
+Result: **FAILED** (`exit_code=1`)
+
+Runtime and memory:
+
+- Total elapsed: ~56.17 minutes (`elapsed_ms=3370080`)
+- Peak Python RSS: `33523780` KB (`peak_rss_gb=31.971`)
+
+Observed behavior:
+
+- Run remained clean through ~50 minutes, then emitted repeated autotune-time:
+  - `Triton Error [HIP]: Code: 209`
+  - `CUDA error: no kernel image is available for execution on the device`
+  - `hipErrorNoBinaryForGpu`
+- `large` timing iterations completed before failure.
+- Terminal traceback ended with:
+  - `torch._inductor.exc.InductorError: AcceleratorError: CUDA error: no kernel image is available for execution on the device`
+
+Conclusion:
+
+- `v1` (`gc.collect()` only) is insufficient for launcher=0 mixed-network case
+  under no-subprocess autotuning.
+
+### Run R (step 2): no subprocess + patch v2 (PyCodeCache eviction + `gc.collect()`)
+
+Patch applied:
+
+- `gc_module_unload_v2.patch` semantics in
+  `torch/_inductor/select_algorithm.py`:
+  - keep `result = benchmark_fn(choices)`
+  - collect `choice.bmreq.module_path` entries
+  - evict those paths from `PyCodeCache.modules_no_attr` and `PyCodeCache.modules`
+  - call `gc.collect()`
+
+Command:
+
+```bash
+STATIC_LAUNCHER=0 WORKLOAD_NETWORKS="large extralarge" \
+  TORCHINDUCTOR_RELEASE_UNUSED_TRITON_KERNELS=0 \
+  TORCHINDUCTOR_RELEASE_UNUSED_TRITON_KERNELS_GC=0 \
+  TORCHINDUCTOR_AUTOTUNE_IN_SUBPROC=0 \
+  LOG_PREFIX=matrix-nosubproc-v2-launcher0 \
+  bash run_workload.sh
+```
+
+Result: **FAILED** (`exit_code=1`)
+
+Runtime and memory:
+
+- Total elapsed: ~54.45 minutes (`elapsed_ms=3267201`)
+- Peak Python RSS: `34043236` KB (`peak_rss_gb=32.466`)
+
+Observed behavior:
+
+- Same late-window failure signature as v1:
+  - repeated `Triton Error [HIP]: Code: 209`
+  - repeated `CUDA error: no kernel image is available for execution on the device`
+  - repeated `hipErrorNoBinaryForGpu`
+- `large` timing iterations completed before failure.
+- Terminal traceback ended with:
+  - `torch._inductor.exc.InductorError: AcceleratorError: CUDA error: no kernel image is available for execution on the device`
+
+Conclusion:
+
+- `v2` (PyCodeCache eviction + `gc.collect()`) is also insufficient for
+  launcher=0 mixed-network case under no-subprocess autotuning.
+
+### Run S (step 2): no subprocess + patch v3
+
+Patch applied:
+
+- `gc_module_unload_v3.patch` semantics in
+  `torch/_inductor/select_algorithm.py`:
+  - all v2 behavior (module path eviction from PyCodeCache containers)
+  - drop matching module names from `sys.modules`
+  - call `self.precompile_cache.clear()`
+  - call `gc.collect()`
+
+Command:
+
+```bash
+STATIC_LAUNCHER=0 WORKLOAD_NETWORKS="large extralarge" \
+  TORCHINDUCTOR_RELEASE_UNUSED_TRITON_KERNELS=0 \
+  TORCHINDUCTOR_RELEASE_UNUSED_TRITON_KERNELS_GC=0 \
+  TORCHINDUCTOR_AUTOTUNE_IN_SUBPROC=0 \
+  LOG_PREFIX=matrix-nosubproc-v3-launcher0 \
+  bash run_workload.sh
+```
+
+Result: **PASSED** (`exit_code=0`)
+
+Runtime and memory:
+
+- Start: `2026-03-19T07:39:31+00:00`
+- End: `2026-03-19T09:00:16+00:00`
+- Peak Python RSS: `peak_rss_gb=32.482`
+
+Observed behavior:
+
+- `TRITON_HIP_USE_ASYNC_COPY=0`
+- No `hipErrorNoBinaryForGpu`
+- No `CUDA error: no kernel image is available for execution on the device`
+- No `Triton Error [HIP]: Code: 209`
+- No traceback
+
+Conclusion:
+
+- v3 (`select_algorithm.py` benchmark-module eviction + `sys.modules` cleanup +
+  `precompile_cache.clear()` + `gc.collect()`) is sufficient to make the
+  launcher=0 no-subprocess mixed-network run pass in this environment.
+
+### Run V (validation): no subprocess + v3 + launcher=1 with async-copy unset
+
+Objective:
+
+- Determine whether `TRITON_HIP_USE_ASYNC_COPY=0` is still required after the
+  current fix stack.
+
+Command:
+
+```bash
+env -u TRITON_HIP_USE_ASYNC_COPY \
+  STATIC_LAUNCHER=1 WORKLOAD_NETWORKS="large extralarge" \
+  TORCHINDUCTOR_RELEASE_UNUSED_TRITON_KERNELS=0 \
+  TORCHINDUCTOR_RELEASE_UNUSED_TRITON_KERNELS_GC=0 \
+  TORCHINDUCTOR_AUTOTUNE_IN_SUBPROC=0 \
+  LOG_PREFIX=matrix-noasynccopy-v3-wpeu0-launcher1 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `matrix-noasynccopy-v3-wpeu0-launcher1.log`
+- `matrix-noasynccopy-v3-wpeu0-launcher1.cpu-mem.log`
+
+Result: **PASSED** (`exit_code=0`)
+
+Runtime and memory:
+
+- Start: `2026-03-20T00:57:30+00:00`
+- End: `2026-03-20T02:16:04+00:00`
+- Peak Python RSS: `peak_rss_gb=24.719`
+
+Observed behavior:
+
+- `TRITON_HIP_USE_ASYNC_COPY=unset` confirmed in run metadata.
+- No `hipErrorNoBinaryForGpu`
+- No `CUDA error: no kernel image is available for execution on the device`
+- No `Triton Error [HIP]: Code: 209`
+- No traceback
+
+### Run W (validation): no subprocess + v3 + launcher=0 with async-copy unset
+
+Companion run for launcher disabled under the same no-async-copy condition.
+
+Command:
+
+```bash
+env -u TRITON_HIP_USE_ASYNC_COPY \
+  STATIC_LAUNCHER=0 WORKLOAD_NETWORKS="large extralarge" \
+  TORCHINDUCTOR_RELEASE_UNUSED_TRITON_KERNELS=0 \
+  TORCHINDUCTOR_RELEASE_UNUSED_TRITON_KERNELS_GC=0 \
+  TORCHINDUCTOR_AUTOTUNE_IN_SUBPROC=0 \
+  LOG_PREFIX=matrix-noasynccopy-v3-wpeu0-launcher0 \
+  bash run_workload.sh
+```
+
+Artifacts:
+
+- `matrix-noasynccopy-v3-wpeu0-launcher0.log`
+- `matrix-noasynccopy-v3-wpeu0-launcher0.cpu-mem.log`
+
+Result: **PASSED** (`exit_code=0`)
+
+Runtime and memory:
+
+- Start: `2026-03-20T02:17:00+00:00`
+- End: `2026-03-20T03:36:15+00:00`
+- Peak Python RSS: `peak_rss_gb=32.478`
+
+Observed behavior:
+
+- `TRITON_HIP_USE_ASYNC_COPY=unset` confirmed in run metadata.
+- No `hipErrorNoBinaryForGpu`
+- No `CUDA error: no kernel image is available for execution on the device`
+- No `Triton Error [HIP]: Code: 209`
+- No traceback
+
+Conclusion from Runs V/W:
+
+- With the current patch stack, `TRITON_HIP_USE_ASYNC_COPY=0` is not required
+  for the `large + extralarge` reproducer, for either launcher mode.
+
+### Run X (DDP check): `torchrun` reproducer with no extra environment variables
+
+Objective:
+
+- Validate that the DDP/Triton reproducer now runs without the historical
+  no-kernel-image failure and without requiring extra env vars.
+
+Command (exact, no extra env vars):
+
+```bash
+torchrun --nproc_per_node=1 reproducer_ddp_triton_error.py --compile
+```
+
+#### Run X1 (first attempt)
+
+Result: **FAILED early** due to missing Python dependency, not a Triton/HIP failure.
+
+- Error:
+  - `ModuleNotFoundError: No module named 'einops'`
+- Exit:
+  - `exit_code=1`
+  - `elapsed_ms=5087`
+
+Remediation:
+
+```bash
+python -m pip install einops
+```
+
+#### Run X2 (rerun after dependency install)
+
+Command (same exact command as above, still no extra env vars):
+
+```bash
+torchrun --nproc_per_node=1 reproducer_ddp_triton_error.py --compile
+```
+
+Result: **PASSED**
+
+- End marker:
+  - `=== Test Completed ===`
+- Exit:
+  - `exit_code=0`
+  - `elapsed_ms=1232167` (~20.5 min)
+  - `ended_at=2026-03-20T15:32:17.728Z`
+
+Observed behavior:
+
+- No `hipErrorNoBinaryForGpu`
+- No `CUDA error: no kernel image is available for execution on the device`
+- No `Triton Error [HIP]: Code: 209`
+- No traceback on the successful run
+
+Conclusion from Run X:
+
+- For this DDP reproducer, no additional environment variables are needed.
+- The only blocker encountered was a missing Python package dependency
+  (`einops`), after which the command passed cleanly.
