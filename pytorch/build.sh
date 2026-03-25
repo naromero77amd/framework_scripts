@@ -13,7 +13,6 @@
 python3 setup.py clean # needed when switching branches
 # git clean . -dfx # some times also needed due to leftoever files due to submodules that have been removed
 git submodule sync --recursive # synchronizes url in .gitmodules, do this recursively
-git submodule foreach --recursive git reset --hard # cleanup in case there is a detached HEAD, not fullproof
 git submodule update --init --recursive # clones missing submodules
 
 export MAX_JOBS=128 # use as many CPU cores as possible to build PyTorch
@@ -36,4 +35,4 @@ unset CPLUS_INCLUDE_PATH # needed on some internal AMD docker images.
 
 # Build a subset of PyTorch features, balance of build speed with functionality.
 # don't build MPI support, FBGEMM, or compiled-tests
-USE_ROCM=1 REL_WITH_DEB_INFO=1 USE_FLASH_ATTENTION=1 USE_MEM_EFF_ATTENTION=1 USE_KINETO=1 USE_FBGEMM=0 USE_MPI=0 USE_MAGMA=1 BUILD_TEST=0 python setup.py install 2>&1 | tee build.log # works
+USE_ROCM=1 REL_WITH_DEB_INFO=1 USE_FBGEMM=0 USE_MPI=0 BUILD_TEST=0 python setup.py install 2>&1 | tee build.log # works
