@@ -1579,3 +1579,170 @@ Conclusion from Run X:
 - For this DDP reproducer, no additional environment variables are needed.
 - The only blocker encountered was a missing Python package dependency
   (`einops`), after which the command passed cleanly.
+
+## 2026-03-24 Clarifications from code review discussion
+
+### Unload cadence (what "aggressive" means)
+
+The benchmark cleanup runs in `AlgorithmSelectorCache.benchmark()` **after**
+`benchmark_fn(choices)` returns for one autotune choice set (one kernel site).
+This means:
+
+- It is **not** per-candidate.
+- It is **not** delayed until all kernels in the model finish autotuning.
+- It is once per autotune round for each site.
+
+### Benchmark template modules vs runtime winner kernels
+
+Two different lifetimes are involved:
+
+1. **Benchmark template modules** (autotune artifacts)
+   - Loaded through `TritonBenchmarkRequest.make_run_fn()` via
+     `PyCodeCache.load_by_key_path(...)` for timing candidate choices.
+   - After timing, v3 cleanup evicts benchmark modules from:
+     - `PyCodeCache.modules_no_attr`
+     - `PyCodeCache.modules`
+     - `sys.modules`
+   - Then `precompile_cache.clear()` + `gc.collect()` allow stale benchmark
+     `CompiledKernel` objects to be collected and unloaded.
+
+2. **Runtime winner kernels** (execution artifacts)
+   - The kernel object used by compiled graph execution is kept alive by runtime
+     launchers and normal graph/object ownership.
+   - For static launcher, module unload occurs in
+     `StaticallyLaunchedTritonKernel.__del__` when the owner is unreachable.
+
+Practical implication: the benchmark-side instance of a "winner" may be
+collected after autotune, and the runtime-side winner is then (re)loaded as the
+execution object/handle.
+
+### Runtime/performance impact
+
+- There can be compile-time overhead from reloading winner kernels for runtime
+  after benchmark artifact eviction.
+- There is **no per-launch hot-path unload/reload** behavior introduced.
+- Tradeoff is intentional: small compile-time overhead vs avoiding fatal
+  driver module-table exhaustion.
+
+### Reviewer concern: "one user of modules we are unloading"
+
+Reviewer question: "How are we ensuring there is only one user of the modules
+we are unloading?"
+
+Clarified ownership model:
+
+- Module handles are owned per kernel object (not a shared global pool).
+- Generated launchers hold `runner=self.kernel.run` (bound method), which keeps
+  the owner object alive while launchers are reachable.
+- Unload happens from owner `__del__`, after the object becomes unreachable.
+
+Validation added:
+
+- Unit test:
+  `test/inductor/test_static_triton_launcher.py::TestStaticTritonLauncher::test_launcher_keeps_module_owner_alive_until_release`
+- Commit:
+  `d1c4d96a4ae`
+- Focus:
+  verifies launcher-held `runner` keeps owner alive; unload occurs only after
+  launcher release.
+
+## 2026-03-27 Review-comment patch set (final validated form)
+
+### Motivation
+
+The earlier experimental `v3` shape fixed the reproducer by evicting
+benchmark-only modules from `PyCodeCache`, removing their names from
+`sys.modules`, clearing `precompile_cache`, and then forcing
+`gc.collect()`. Review feedback asked for a narrower ownership model:
+
+- avoid publishing benchmark-only modules globally when they are not needed for
+  runtime imports
+- avoid clearing unrelated `precompile_cache` entries that belong to other
+  autotune sites
+
+The follow-up patch set keeps the original lifetime goal, but narrows how the
+references are created and released.
+
+### Patch summary
+
+1. **`PyCodeCache` gets optional `sys.modules` registration control**
+   - `PyCodeCache.load()` and `PyCodeCache.load_by_key_path()` now accept
+     `set_sys_modules: bool | None`.
+   - Default behavior is unchanged for normal top-level/runtime loads:
+     `None` still follows `in_toplevel_process()`.
+   - Benchmark-only callers can pass `False`, which allows the module to be
+     cached in `PyCodeCache` without publishing it into `sys.modules`.
+   - If a later cache hit comes from a caller that does want registration, the
+     cached module is inserted into `sys.modules` at that time so runtime
+     behavior remains correct.
+
+2. **Benchmark/autotune-only loads stop creating global module roots**
+   - `TritonBenchmarkRequest.make_run_fn()`
+   - `TritonBenchmarkRequest.precompile()`
+   - `CuteDSLBenchmarkRequest.make_run_fn()`
+   - `TritonTemplate` benchmark template loads
+   now use `set_sys_modules=False`.
+   - This means benchmark artifacts are no longer kept alive by
+     `sys.modules`; after the autotune round, the remaining strong references
+     are the `PyCodeCache` containers and the site-local precompile closure.
+
+3. **Post-benchmark cleanup is narrowed to the active autotune site**
+   - `AlgorithmSelectorCache.benchmark()` still evicts matching benchmark module
+     paths from `PyCodeCache.modules_no_attr` and `PyCodeCache.modules`.
+   - It no longer removes names from `sys.modules`, because benchmark-only
+     loads are no longer registered there.
+   - It no longer calls `self.precompile_cache.clear()`.
+   - Instead, the precompile closure now carries its `precompile_key`, that key
+     is threaded through the benchmark/lookup flow, and cleanup does only:
+     `self.precompile_cache.pop(precompile_key, None)`.
+   - The final selected form does not call explicit `gc.collect()` after that
+     cleanup; once benchmark-only ownership was narrowed, the validated
+     reproducer sequence stayed green without forcing collection.
+
+4. **Only minimal regression coverage was kept**
+   - `test/inductor/test_codecache.py`
+     - verifies `load_by_key_path(..., set_sys_modules=False)` can defer
+      registration, and that a later normal load still registers the cached
+      module
+   - `test/inductor/test_select_algorithm.py`
+     - verifies benchmark cleanup removes only the matching
+       `precompile_cache` entry
+
+### Why this is better than the experimental `v3` form
+
+- It preserves the original module-lifetime fix: benchmark-only
+  `CompiledKernel` objects can still become unreachable after autotune so their
+  CUDA/HIP modules can unload promptly.
+- It avoids broad `sys.modules` churn by not registering benchmark-only modules
+  there in the first place.
+- It avoids clearing unrelated `precompile_cache` entries, so other autotune
+  sites can keep sharing their cached precompile work.
+- It also avoids forced full-GC churn in the final selected form; the narrowed
+  ownership cleanup alone was sufficient under the validated reproducers.
+- It keeps normal runtime module-registration behavior intact for non-benchmark
+  loads.
+
+### Selected final patch stack
+
+- This supersedes the earlier mixed code+UT commit `51dfbd9a67e`.
+- Code change:
+  `0697c9fde94` `[inductor] Avoid global refs for benchmark codecache modules`
+- Minimal UTs:
+  `55aa3ce3ce1` `[inductor] Add minimal coverage for autotune cleanup ownership`
+- Final follow-up:
+  `11b8adb56c3` `[inductor] Drop explicit autotune cleanup GC`
+- Selected runtime shape:
+  - benchmark-only module loads use `set_sys_modules=False`
+  - cleanup evicts benchmark paths from `PyCodeCache` and pops only the active
+    `precompile_key`
+  - there is no explicit post-benchmark `gc.collect()`
+- Validation sequence on the selected stack:
+  1. `STATIC_LAUNCHER=0` with `WORKLOAD_NETWORKS="large extralarge"`:
+     passed in about `75.7 min`
+  2. `STATIC_LAUNCHER=1` with `WORKLOAD_NETWORKS="large extralarge"`:
+     passed in about `75.0 min`
+  3. `torchrun --nproc_per_node=1 reproducer_ddp_triton_error.py --compile`:
+     passed in about `10.2 min`
+- Across the final validation sequence there was no
+  `hipErrorNoBinaryForGpu`, no `no kernel image`, no Triton HIP 209 signature,
+  and no traceback.
