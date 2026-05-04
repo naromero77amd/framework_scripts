@@ -63,7 +63,7 @@ PYTORCH_RESET_SUBMODULES=1 is set. Resetting and cleaning submodules so they
 match the commits recorded by the PyTorch superproject.
 
 EOF
-  git submodule foreach --recursive 'git reset --hard && git clean -fdx'
+  git submodule foreach --recursive 'git reset --hard && git clean -ffdx'
 }
 
 sync_submodules() {
@@ -72,6 +72,9 @@ sync_submodules() {
   if [[ "${PYTORCH_RESET_SUBMODULES:-0}" == "1" ]]; then
     reset_submodules
     git submodule update --init --recursive
+    # Updating a submodule to the expected commit can make files from its
+    # previous checkout become untracked, so clean once more after checkout.
+    reset_submodules
   elif ! git submodule update --init --recursive; then
     echo
     echo "Submodule checkout failed. This usually means one or more submodules"
