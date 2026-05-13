@@ -10,6 +10,17 @@ require_pytorch_checkout() {
   [[ -f setup.py && -d .git && -d tools/amd_build ]] || die "Run this script from the PyTorch repository root."
 }
 
+require_build_backend() {
+  PYTORCH_BUILD_BACKEND="${PYTORCH_BUILD_BACKEND:-rocm}"
+
+  case "$PYTORCH_BUILD_BACKEND" in
+    rocm|cuda) ;;
+    *) die "PYTORCH_BUILD_BACKEND must be 'rocm' or 'cuda'." ;;
+  esac
+
+  export PYTORCH_BUILD_BACKEND
+}
+
 print_dirty_submodules() {
   git submodule foreach --quiet --recursive '
     if ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]; then
@@ -115,6 +126,7 @@ EOF
 }
 
 require_pytorch_checkout
+require_build_backend
 # Optional if you have a pre-built AOTriton, otherwise, default behavior is to download it.
 # Build AOTriton is slow, so leave section below alone.
 # AOTRITONBASEDIR=/home/niromero/root/installed_aotriton
@@ -135,11 +147,7 @@ python3 setup.py clean # needed when switching branches
 # git clean . -dfx # some times also needed due to leftoever files due to submodules that have been removed
 
 export MAX_JOBS=128 # use as many CPU cores as possible to build PyTorch
-unset PYTORCH_ROCM_ARCH # much faster, only build the architecture found on the host
-# export PYTORCH_ROCM_ARCH="gfx90a;gfx942"
-# export PYTORCH_ROCM_ARCH=gfx90a
 pip uninstall -y torch # otherwise, the final PyTorch install could fail
-python tools/amd_build/build_amd.py # hipification
 
 # Legacy, only needed if building AOTriton from scratch.
 # the three lines below are because aotriton build system is problematic 
@@ -154,4 +162,22 @@ unset CPLUS_INCLUDE_PATH # needed on some internal AMD docker images.
 
 # Build a subset of PyTorch features, balance of build speed with functionality.
 # don't build MPI support, FBGEMM, or compiled-tests
-USE_ROCM=1 REL_WITH_DEB_INFO=1 USE_FBGEMM=0 USE_MPI=0 BUILD_TEST=0 python setup.py install 2>&1 | tee build.log # works
+common_env=(REL_WITH_DEB_INFO=1 USE_FBGEMM=0 USE_MPI=0 BUILD_TEST=0)
+
+if [[ "$PYTORCH_BUILD_BACKEND" == "rocm" ]]; then
+  unset TORCH_CUDA_ARCH_LIST
+  # Leave PYTORCH_ROCM_ARCH unset by default so PyTorch builds the host arch.
+  # Callers can export PYTORCH_ROCM_ARCH before running this script to override.
+  python tools/amd_build/build_amd.py # hipification
+  env "${common_env[@]}" USE_ROCM=1 python setup.py install 2>&1 | tee build.log # works
+else
+  unset PYTORCH_ROCM_ARCH
+  unset ROCM_PATH
+  export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+  export CUDA_PATH="${CUDA_PATH:-$CUDA_HOME}"
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  # CUDA target is currently hard-coded for NVIDIA H100/Hopper.
+  export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0;9.0a}"
+  env "${common_env[@]}" USE_CUDA=1 USE_ROCM=0 python setup.py install 2>&1 | tee build.log
+fi
