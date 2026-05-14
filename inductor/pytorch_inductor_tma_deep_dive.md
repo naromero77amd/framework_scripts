@@ -21,7 +21,8 @@ This document focuses on how TMA support is currently implemented in Inductor, w
 
 3. **For AMD, is the TMA-like feature TDM, and would Gluon help?**
    - Potentially yes, because it provides backend-oriented ops and lowering hooks.
-   - But Inductor would still need backend-specific capability checks, legality rules, autotuning integration, and fallbacks.
+   - TDM should not be treated as "CUDA TMA with AMD descriptors" at the Inductor level.
+   - Inductor would still need backend-specific capability checks, legality rules, autotuning integration, and fallbacks.
 
 4. **Why not only generate generic Triton and let Triton decide TMA/TDM?**
    - Inductor must decide legality and profitability, allocate extra resources, choose schedules/templates, and keep safe fallbacks.
@@ -259,14 +260,14 @@ Usually **no**, and with today’s architecture it should not.
 - Inductor currently generates Triton kernels/source (Python-level Triton DSL), not Triton MLIR dialect IR directly.
 - AMD dialect ops (for example, `amdg.async_tdm_*`) are Triton compiler internal/lowering-level representations.
 - The normal integration model is:
-  1. Inductor emits Triton-level operations/APIs that express async descriptor/data-movement intent.
+  1. Inductor emits Triton-level operations/APIs or template metadata that express async data-movement intent.
   2. Triton lowers those to backend dialect ops (`amdg.*` for AMD).
 
 What this means in practice:
 
 - You generally do **not** add direct `amdg.*` dialect emission in Inductor.
 - You **do** add/extend Inductor predicates + templates so generated Triton code is TDM-friendly and reliably triggers Triton’s AMD lowering path.
-- Relying only on fully generic `tl.load`/`tl.store` may yield partial compiler optimizations, but it usually provides less control and weaker guarantees than explicit async/descriptor-style templates.
+- Relying only on fully generic `tl.load`/`tl.store` may yield partial compiler optimizations, but it usually provides less control and weaker guarantees than explicit async/template-level intent.
 
 ### Q: Inductor supports custom Triton kernels. Does it support custom Gluon kernels?
 
@@ -290,7 +291,13 @@ Practical interpretation:
 
 ## 6) AMD TDM Support from Inductor: What Would Be Needed
 
-Current upstream signals suggest AMD-side TDM and async tensor-movement building blocks exist in Triton/Gluon:
+The current issue framing is that this is mostly a performance/integration
+scoping item, not a broad functionality bring-up. Initial TDM compiler-side
+work already exists; the Inductor question is how much policy, template, and
+runtime plumbing is needed to make TDM reliably usable from generated kernels.
+
+Current upstream signals suggest AMD-side TDM and async tensor-movement
+building blocks exist in Triton/Gluon:
 
 - [triton-lang/triton#7220](https://github.com/triton-lang/triton/pull/7220)
 - [triton-lang/triton#7880](https://github.com/triton-lang/triton/pull/7880)
@@ -302,68 +309,189 @@ In Triton docs, AMD dialect operations include forms like:
 - `amdg.async_tdm_copy_global_to_local`
 - `amdg.async_tdm_wait`
 
-### 6.1 Minimum Inductor work items for an AMD analog
+Important distinction:
 
-1. **Capability probes**
-   - Add explicit checks in `torch/utils/_triton.py` for AMD/Gluon APIs.
+- Triton/Gluon can own lowering to AMD dialect ops.
+- Inductor still owns when to select a TDM-friendly path, what templates enter
+  autotuning, which shapes/layouts are legal, what runtime/compiler options are
+  required, and what fallback path remains available.
 
-2. **Legality predicate**
-   - Add an AMD-specific predicate analogous to `use_triton_tma_template(...)`.
+### 6.1 Current status and non-goals
 
-3. **Template additions**
-   - Add AMD-specific template variants in MM paths (`mm.py`, `mm_scaled_grouped.py`), with backend-appropriate async/tensor-move ops.
+The existing evidence points to this status:
 
-4. **Option/symbol plumb-through**
-   - Add any required template constants, descriptor sizes, barrier semantics, or argument encodings.
+- Initial TDM enablement was done below Inductor, primarily in Triton/Gluon.
+- The remaining Inductor-facing work is likely performance-oriented: selection
+  policy, heuristic integration, template coverage, and removal of architecture
+  assumptions that would block good MI450 behavior.
+- AMD TDM is not expected to require a TMA-style tensor descriptor model in
+  Inductor. Unless Triton exposes a future host descriptor API for this path,
+  do not assume new `TMADescriptor`-like IR nodes, `TMADescriptorArg`-like
+  arguments, `nvTmaDesc`-style signatures, or host-side descriptor wrapper
+  helpers are needed.
+- Removing `matrix_instr_nonkdim` is not currently a blocking TDM task. The
+  local analysis found it is still wired through ROCm autotuning and compile
+  metadata, and the issue notes that removal is deferred until Triton compiler
+  support changes.
+- Hard-coded warp/wavefront assumptions are a real cleanup item. Several
+  Inductor paths still use constants such as `32` or `64` for warp-size or
+  thread-count decisions; those should use device/compiler metadata where
+  possible before treating new AMD architecture behavior as stable.
 
-5. **Wrapper/AOT handling**
-   - If AMD path uses host descriptors, add wrapper/C++ helper support.
-   - If descriptor-in-kernel only, focus on workspace/runtime plumbing.
+### 6.2 Minimum Inductor work items for AMD TDM
 
-6. **Scheduler + autotune integration**
-   - Add/adjust fusion and autotune constraints similar to current TMA paths.
+1. **Inventory what already happens automatically**
+   - Determine which generated Triton kernels already lower to TDM on the
+     target Triton/Gluon stack.
+   - Separate "TDM is generated by the backend" from "Inductor intentionally
+     selected a TDM-suitable schedule."
 
-7. **Fallback and tests**
-   - Preserve non-AMD-async fallback paths and add targeted correctness/perf tests.
+2. **Capability probes**
+   - Add explicit checks in `torch/utils/_triton.py` for the AMD device,
+     Triton version/API availability, and any Gluon/TDM feature probes needed
+     for intentional TDM template selection.
 
-### 6.2 Should Inductor support AMD dialect ops directly?
+3. **Legality predicate**
+   - Add an AMD-specific predicate analogous to `use_triton_tma_template(...)`
+     if Inductor selects explicit TDM-friendly templates.
+   - Keep the predicate focused on observable constraints: architecture,
+     dtype, alignment, strides/layout, block shape, supported pipeline shape,
+     and any known TDM limits.
+
+4. **Template additions or template annotations**
+   - If generic Triton templates already lower well, Inductor may only need
+     annotations/config metadata that steer autotuning.
+   - If performance requires explicit async tensor movement, add AMD-specific
+     template variants in MM paths such as `mm.py` and
+     `mm_scaled_grouped.py`.
+
+5. **Option/symbol plumb-through**
+   - Add any required template constants, barrier semantics, wait semantics,
+     wavefront-sensitive values, or argument encodings.
+   - Avoid baking in warp-size constants; prefer device properties or compiler
+     metadata.
+
+6. **No descriptor plumbing expected initially**
+   - Do not mirror CUDA TMA's host-side descriptor path unless the AMD/Triton
+     API requires it.
+   - Initial Inductor work should avoid adding `TMADescriptor` analogs,
+     descriptor workspace sizing, or wrapper/C++ descriptor materialization.
+   - If later Triton APIs expose a host descriptor model for AMD TDM, treat that
+     as a separate integration layer rather than assuming it is part of the
+     first TDM enablement.
+
+7. **Scheduler + autotune integration**
+   - Add or adjust fusion, persistent-kernel, and autotune constraints similar
+     to current TMA paths.
+   - Track TDM-relevant knobs in the algorithm-selection cache key only when
+     they affect generated code or runtime behavior.
+
+8. **Fallback and tests**
+   - Preserve non-TDM fallback paths and add targeted correctness/perf tests.
+   - Include negative tests for shapes/layouts that should not select the TDM
+     path.
+
+### 6.3 Should Inductor support AMD dialect ops directly?
 
 Recommended approach:
 
 - Keep Inductor at Triton API/template level.
 - Do not directly model `amdg.*` dialect operations in Inductor.
-- Add Triton-level TDM-oriented template code and capability gates, then rely on Triton lowering to generate AMD dialect ops.
+- Add Triton-level TDM-oriented template code, annotations, and capability
+  gates only where Inductor needs predictable selection/performance.
+- Let Triton/Gluon lower those operations to AMD dialect ops.
+- Do not copy CUDA TMA's tensor descriptor plumbing unless an AMD-facing Triton
+  API makes descriptors part of the frontend contract.
 
-Only consider direct dialect emission if Inductor architecture changes to generate Triton MLIR directly (not the current model).
+Only consider direct dialect emission if Inductor architecture changes to
+generate Triton MLIR directly, which is not the current model.
 
 Can we just use regular Triton ops?
 
-- Sometimes yes: backend passes may still optimize/load-store patterns.
-- But for consistent TDM behavior, explicit TDM-oriented templates and gating in Inductor are more reliable than hoping generic `tl.load`/`tl.store` patterns are recognized in all cases.
-- Recommended strategy:
-  1. keep Inductor at Triton API level,
-  2. add explicit TDM-friendly templates where performance/behavior matters,
-  3. let Triton lower to AMD dialect ops.
+- Sometimes yes: backend passes may still optimize load/store patterns into
+  TDM-capable code.
+- If that already gives the desired performance on MI450, Inductor work may be
+  limited to testing, heuristics, and cleanup of hard-coded architecture
+  assumptions.
+- If performance is inconsistent, explicit TDM-friendly templates and gating in
+  Inductor are more reliable than hoping generic `tl.load`/`tl.store` patterns
+  are recognized in all cases.
 
-### 6.3 Illustrative pseudo-API shape (design sketch)
+### 6.4 Illustrative pseudo-API shape (design sketch)
 
 ```python
-def use_triton_amd_async_template(*matrices):
-    from torch.utils._triton import has_triton_amd_async_device
+def use_triton_amd_tdm_template(*matrices):
+    from torch.utils._triton import has_triton_amd_tdm_device
     return (
-        config.triton.enable_persistent_amd_async_matmul
-        and has_triton_amd_async_device()
-        and all(_is_amd_async_compatible(m) for m in matrices)
+        config.triton.enable_persistent_amd_tdm_matmul
+        and has_triton_amd_tdm_device()
+        and all(_is_amd_tdm_compatible(m) for m in matrices)
     )
 ```
 
 ```python
 # Pseudo-template intent (names illustrative):
-# - create/update descriptor or async transfer state
-# - async global->shared transfers
-# - explicit wait/barrier points
+# - issue async tensor movement
+# - insert explicit wait/barrier points
 # - compute on local/shared tiles
 ```
+
+### 6.5 MI450 TDM-readiness action items
+
+If an MI450 were available today, reasonable readiness work would be:
+
+1. **Confirm compiler stack support**
+   - Build/run with the intended PyTorch + Triton/Gluon stack.
+   - Verify Triton recognizes the MI450 target correctly.
+   - Confirm TDM-capable lowering is enabled and not silently falling back.
+
+2. **Create a small TDM visibility test**
+   - Pick a few simple Triton kernels that should lower to TDM.
+   - Dump Triton IR, AMDGPU dialect, LLVM IR, or ISA as available.
+   - Check for expected `amdg.async_tdm_*`-style ops or corresponding final
+     ISA patterns.
+
+3. **Inventory Inductor-generated kernels**
+   - Run representative Inductor matmul, scaled-mm, and flex-attention cases on
+     MI450.
+   - Save generated Triton source and compiler dumps.
+   - Classify cases as already TDM-lowered, not TDM-lowered but eligible, or
+     ineligible.
+
+4. **Benchmark generic Triton first**
+   - Before adding AMD-specific Inductor templates, measure whether existing
+     generic Inductor Triton templates already lower well to TDM.
+   - Compare against non-TDM/fallback behavior and CK or other available
+     baselines where relevant.
+
+5. **Audit hard-coded warp/wavefront assumptions**
+   - Prioritize fixed `32` or `64` values in scheduling, launch sizing,
+     autotune heuristics, and config generation.
+   - Replace with device/compiler metadata where possible.
+
+6. **Define legality and negative cases**
+   - Identify TDM constraints for dtype, layout, alignment, block shape,
+     pipeline shape, and padding.
+   - Add tests proving unsupported shapes do not select a TDM-sensitive path
+     incorrectly.
+
+7. **Check autotuning behavior**
+   - Verify TDM-friendly configs are present in the candidate set.
+   - Ensure autotuning does not prune them because of stale CUDA/HIP
+     assumptions.
+   - Add TDM-relevant knobs to cache keys only when they affect generated code.
+
+8. **Avoid descriptor plumbing for now**
+   - Do not add `TMADescriptor`-style IR, wrapper, or AOT descriptor paths
+     unless Triton exposes an AMD-facing frontend descriptor contract.
+   - Treat TDM readiness as lowering, scheduling, and performance validation
+     first.
+
+First milestone:
+
+- On MI450, identify at least one Inductor-generated matmul-like kernel that
+  lowers to TDM, validate correctness, dump evidence from the compiler pipeline,
+  and compare performance against the current fallback path.
 
 ---
 
@@ -378,12 +506,16 @@ This section summarizes additional upstream work after initial gfx1250 TDM enabl
 - [#8479](https://github.com/triton-lang/triton/pull/8479): skinny block support for TDM.
 - [#8510](https://github.com/triton-lang/triton/pull/8510): `ttg.async_wait` support on gfx1250 path.
 
-### 7.2 Descriptor model expansion
+### 7.2 Compiler-side descriptor and dimensionality expansion
 
 - [#8722](https://github.com/triton-lang/triton/pull/8722): initial host-side TDM descriptor exposure in Gluon.
 - [#8743](https://github.com/triton-lang/triton/pull/8743): TDM load/store support for 1D-5D.
 - [#8977](https://github.com/triton-lang/triton/pull/8977): host TDM descriptor support for 1D-5D on gfx1250.
 - [#9730](https://github.com/triton-lang/triton/pull/9730): col-major support for device-side TDM descriptors.
+
+These are Triton/Gluon compiler-side milestones. They do not imply that
+Inductor should mirror CUDA TMA's `TMADescriptor` IR, `nvTmaDesc` signatures, or
+host-side wrapper descriptor plumbing for AMD TDM.
 
 ### 7.3 Data movement feature growth (gather/scatter/prefetch)
 
@@ -418,7 +550,7 @@ This section summarizes additional upstream work after initial gfx1250 TDM enabl
 
 Interpretation:
 
-- The trajectory is clear: initial TDM functionality was followed by descriptor-generalization, gather/scatter expansion, wait/pipeline integration, and a long tail of correctness/perf fixes.
+- The trajectory is clear: initial TDM functionality was followed by compiler-side dimensionality/descriptor work, gather/scatter expansion, wait/pipeline integration, and a long tail of correctness/perf fixes.
 - This reinforces that "support exists" is only phase 1; production-quality backend support needs sustained follow-up in compiler + tests + heuristics.
 
 ---
@@ -454,5 +586,5 @@ sigType --> staticGap["static_cuda_launcher: nvTmaDesc not supported"]
 - Current Inductor TMA support is **not Gluon-based**.
 - It is **not just config**; it required explicit changes across selection, templates, IR, wrappers, args/signatures, runtime plumbing, and launcher behavior.
 - Relying only on generic Triton code is insufficient because Inductor must make policy and resource decisions before Triton lowering.
-- For AMD, the equivalent path is TDM; support is feasible, but still requires substantial Inductor-side integration.
+- For AMD, the analogous performance path is TDM, but it should not be assumed to require CUDA TMA-style tensor descriptor plumbing in Inductor.
 - Inductor should generally target Triton-level APIs/templates and rely on Triton to lower into AMD dialect ops, rather than emitting AMD dialect ops directly.
