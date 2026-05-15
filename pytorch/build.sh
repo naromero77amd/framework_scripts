@@ -160,24 +160,39 @@ unset CPLUS_INCLUDE_PATH # needed on some internal AMD docker images.
 # Build system assumes ROCM_PATH=/opt/rocm, set explictly if another version of ROCm is going to be used.
 # export ROCM_PATH=/opt/rocm-6.2.0
 
-# Build a subset of PyTorch features, balance of build speed with functionality.
-# don't build MPI support, FBGEMM, or compiled-tests
-common_env=(REL_WITH_DEB_INFO=1 USE_FBGEMM=0 USE_MPI=0 BUILD_TEST=0)
+# Build a subset of PyTorch features, balancing build speed with functionality.
+# Don't build MPI support, FBGEMM, compiled tests, or XNNPACK.
+# Set USE_CK=1 to opt into the ROCm CK/MSLK paths.
+USE_CK="${USE_CK:-0}"
+case "$USE_CK" in
+  0|1) ;;
+  *) die "USE_CK must be 0 or 1." ;;
+esac
+
+common_env=(
+  REL_WITH_DEB_INFO=1
+  USE_FBGEMM=0
+  USE_MPI=0
+  BUILD_TEST=0
+  USE_XNNPACK=0
+  USE_MSLK="${USE_CK}"
+  USE_ROCM_CK_SDPA="${USE_CK}"
+  USE_ROCM_CK_GEMM="${USE_CK}"
+)
 
 if [[ "$PYTORCH_BUILD_BACKEND" == "rocm" ]]; then
-  unset TORCH_CUDA_ARCH_LIST
-  # Leave PYTORCH_ROCM_ARCH unset by default so PyTorch builds the host arch.
-  # Callers can export PYTORCH_ROCM_ARCH before running this script to override.
+  # Force PyTorch to auto-detect the host ROCm arch instead of inheriting a
+  # multi-arch value from the surrounding shell.
+  unset PYTORCH_ROCM_ARCH
   python tools/amd_build/build_amd.py # hipification
   env "${common_env[@]}" USE_ROCM=1 python setup.py install 2>&1 | tee build.log # works
 else
-  unset PYTORCH_ROCM_ARCH
-  unset ROCM_PATH
   export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
   export CUDA_PATH="${CUDA_PATH:-$CUDA_HOME}"
   export PATH="$CUDA_HOME/bin:$PATH"
   export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   # CUDA target is currently hard-coded for NVIDIA H100/Hopper.
-  export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0;9.0a}"
+  unset TORCH_CUDA_ARCH_LIST
+  export TORCH_CUDA_ARCH_LIST="9.0;9.0a"
   env "${common_env[@]}" USE_CUDA=1 USE_ROCM=0 python setup.py install 2>&1 | tee build.log
 fi
