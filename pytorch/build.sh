@@ -70,7 +70,7 @@ submodules_are_clean() {
 reset_submodules() {
   cat <<'EOF'
 
-PYTORCH_RESET_SUBMODULES=1 is set. Resetting and cleaning submodules so they
+PYTORCH_INCREMENTAL_BUILD=0 is set. Resetting and cleaning submodules so they
 match the commits recorded by the PyTorch superproject.
 
 EOF
@@ -80,7 +80,7 @@ EOF
 sync_submodules() {
   git submodule sync --recursive
 
-  if [[ "${PYTORCH_RESET_SUBMODULES:-0}" == "1" ]]; then
+  if [[ "$PYTORCH_INCREMENTAL_BUILD" == "0" ]]; then
     reset_submodules
     git submodule update --init --recursive
     # Updating a submodule to the expected commit can make files from its
@@ -101,7 +101,7 @@ To preserve local submodule work, inspect the dirty submodules above and stash,
 commit, or clean them manually.
 
 For a from-scratch build where it is OK to discard local submodule changes, rerun:
-  PYTORCH_RESET_SUBMODULES=1 bash /home/niromero/docker_workspace/framework_scripts/pytorch/build.sh
+  PYTORCH_INCREMENTAL_BUILD=0 bash /home/niromero/docker_workspace/framework_scripts/pytorch/build.sh
 
 EOF
     exit 1
@@ -118,7 +118,7 @@ To preserve local submodule work, inspect the dirty submodules above and stash,
 commit, or clean them manually.
 
 For a from-scratch build where it is OK to discard local submodule changes, rerun:
-  PYTORCH_RESET_SUBMODULES=1 bash /home/niromero/docker_workspace/framework_scripts/pytorch/build.sh
+  PYTORCH_INCREMENTAL_BUILD=0 bash /home/niromero/docker_workspace/framework_scripts/pytorch/build.sh
 
 EOF
     exit 1
@@ -127,6 +127,12 @@ EOF
 
 require_pytorch_checkout
 require_build_backend
+PYTORCH_INCREMENTAL_BUILD="${PYTORCH_INCREMENTAL_BUILD:-1}"
+case "$PYTORCH_INCREMENTAL_BUILD" in
+  0|1) ;;
+  *) die "PYTORCH_INCREMENTAL_BUILD must be 0 or 1." ;;
+esac
+export PYTORCH_INCREMENTAL_BUILD
 # Optional if you have a pre-built AOTriton, otherwise, default behavior is to download it.
 # Build AOTriton is slow, so leave section below alone.
 # AOTRITONBASEDIR=/home/niromero/root/installed_aotriton
@@ -137,13 +143,17 @@ require_build_backend
 # export AOTRITON_INSTALLED_PREFIX=${AOTRITONBASEDIR}/0.7b-rocm6.2/aotriton
 
 # Keep submodules aligned before uninstalling torch or starting an expensive build.
-# Set PYTORCH_RESET_SUBMODULES=1 for a from-scratch build that may discard local
-# changes inside submodules.
+# Default PYTORCH_INCREMENTAL_BUILD=1 skips destructive clean/reset steps.
+# Set PYTORCH_INCREMENTAL_BUILD=0 for a from-scratch build that may discard local
+# changes inside submodules and clean generated build metadata.
 sync_submodules
 
 # Needed when switching branches, as generated files and build metadata can
-# change in significant ways.
-python3 setup.py clean # needed when switching branches
+# change in significant ways. Incremental builds skip this so interrupted builds
+# can resume without discarding already-built artifacts.
+if [[ "$PYTORCH_INCREMENTAL_BUILD" == "0" ]]; then
+  python setup.py clean # needed when switching branches
+fi
 # git clean . -dfx # some times also needed due to leftoever files due to submodules that have been removed
 
 export MAX_JOBS=128 # use as many CPU cores as possible to build PyTorch
