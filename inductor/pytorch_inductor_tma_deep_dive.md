@@ -371,7 +371,47 @@ Important distinction:
   autotuning, which shapes/layouts are legal, what runtime/compiler options are
   required, and what fallback path remains available.
 
-### 6.1 Current status and non-goals
+### 6.1 TDM-relevant Triton and Gluon API surfaces
+
+For normal Triton kernels, the descriptor APIs to watch are:
+
+- `tl.make_tensor_descriptor(...)`
+- `tl.load_tensor_descriptor(desc, offsets)`
+- `tl.store_tensor_descriptor(desc, offsets, value)`
+- `desc.load(offsets)` / `desc.store(offsets, value)` as equivalent method
+  forms
+- `desc.gather(x_offsets, y_offset)` / `desc.scatter(value, x_offsets, y_offset)`
+- `desc.atomic_add/min/max/and/or/xor(...)`, which are descriptor atomics and
+  less likely to matter for GEMM/TDM validation
+
+For host-side descriptor passing, relevant helper surfaces include:
+
+- `triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(...)`
+- `triton.experimental.gluon.amd.gfx1250.TensorDescriptor.from_tensor(...)`
+
+For explicit Gluon `gfx1250` TDM kernels, the key namespace is:
+
+- `ttgl.amd.gfx1250.tdm.make_tensor_descriptor(...)`
+- `ttgl.amd.gfx1250.tdm.async_load(...)`
+- `ttgl.amd.gfx1250.tdm.async_store(...)`
+- `ttgl.amd.gfx1250.tdm.async_wait(...)`
+- `ttgl.amd.gfx1250.tdm.prefetch(...)`
+- `ttgl.amd.gfx1250.tdm.async_scatter(...)`
+- `ttgl.amd.gfx1250.tdm.async_gather(...)`
+
+For Inductor specifically, the config knob to watch is
+`torch._inductor.config.triton.use_tensor_descriptor`. When enabled and when
+legality checks pass, this is the path that makes generic Inductor Triton
+codegen emit `tl.make_tensor_descriptor(...)` for eligible loads/stores.
+
+Plain `tl.load(ptrs)` / `tl.store(ptrs)` are not the descriptor path, and
+`tl.make_block_ptr(...)` is deprecated in favor of tensor descriptors. On the
+AMD backend, descriptor lowering is especially relevant because tensor
+descriptors are only rewritten back to pointer code when the target architecture
+does **not** support TDM; for `gfx1250`, descriptor operations can survive into
+the TDM-capable lowering path.
+
+### 6.2 Current status and non-goals
 
 The existing evidence points to this status:
 
@@ -393,7 +433,7 @@ The existing evidence points to this status:
   thread-count decisions; those should use device/compiler metadata where
   possible before treating new AMD architecture behavior as stable.
 
-### 6.2 Minimum Inductor work items for AMD TDM
+### 6.3 Minimum Inductor work items for AMD TDM
 
 1. **Inventory what already happens automatically**
    - Determine which generated Triton kernels already lower to TDM on the
@@ -446,7 +486,7 @@ The existing evidence points to this status:
    - Include negative tests for shapes/layouts that should not select the TDM
      path.
 
-### 6.3 Should Inductor support AMD dialect ops directly?
+### 6.4 Should Inductor support AMD dialect ops directly?
 
 Recommended approach:
 
@@ -472,7 +512,7 @@ Can we just use regular Triton ops?
   Inductor are more reliable than hoping generic `tl.load`/`tl.store` patterns
   are recognized in all cases.
 
-### 6.4 Illustrative pseudo-API shape (design sketch)
+### 6.5 Illustrative pseudo-API shape (design sketch)
 
 ```python
 def use_triton_amd_tdm_template(*matrices):
@@ -491,7 +531,7 @@ def use_triton_amd_tdm_template(*matrices):
 # - compute on local/shared tiles
 ```
 
-### 6.5 MI450 TDM-readiness action items
+### 6.6 MI450 TDM-readiness action items
 
 If an MI450 were available today, reasonable readiness work would be:
 
