@@ -126,50 +126,50 @@ below.
 
 In this checkout, "TMA-specific template" means one of two things:
 
-- a distinct template choice whose name/path is specifically TMA-oriented; or
-- an existing template with an explicit `USE_TMA` branch that emits tensor
-  descriptor loads.
+1. A distinct template choice whose name/path is specifically TMA-oriented.
+2. An existing template with an explicit `USE_TMA` branch that emits tensor
+   descriptor loads.
 
 Current coverage breaks down as follows:
 
-- **Plain MM / `addmm`: yes, dedicated persistent TMA template choices.**
-  Relevant files:
-  `torch/_inductor/kernel/templates/triton_persistent_tma_mm.py.jinja`,
-  `torch/_inductor/kernel/templates/triton_blackwell_ws_persistent_device_tma_mm.py.jinja`,
-  registered from `torch/_inductor/kernel/mm.py`.
-- **Scaled MM: yes, dedicated device-TMA scaled-MM template choices.**
-  These cover epilogue-scaling and main-loop-scaling variants. Relevant files:
-  `torch/_inductor/kernel/templates/triton_epilogue_scaled_mm.py.jinja`,
-  `torch/_inductor/kernel/templates/triton_main_loop_scaled_mm.py.jinja`,
-  registered from `torch/_inductor/kernel/mm.py`.
-- **Grouped / scaled grouped MM: partial / conditional.**
-  The grouped template has a `USE_TMA_LOAD` path rather than a separate
-  `*_tma*` file. Relevant files:
-  `torch/_inductor/kernel/templates/triton_mm_grouped.py.jinja`, selected from
-  `torch/_inductor/kernel/mm_grouped.py`.
-- **Flex attention / flex decoding: partial / conditional.**
-  Flex templates are not separate `*_tma*` files, but they have `USE_TMA`
-  branches that create `tl.make_tensor_descriptor(...)` descriptors and use
-  `tl.load_tensor_descriptor(...)`. Relevant files:
-  `torch/_inductor/kernel/flex/templates/flex_attention.py.jinja`,
-  `torch/_inductor/kernel/flex/templates/flex_backwards.py.jinja`,
-  `torch/_inductor/kernel/flex/templates/flex_decode.py.jinja`, and
-  `torch/_inductor/kernel/flex/templates/common.py.jinja`.
-- **Pointwise kernels: no dedicated TMA template.**
-  Generic Triton codegen can emit tensor descriptors when
-  `config.triton.use_tensor_descriptor` is enabled and legality checks pass.
-  Relevant files: `torch/_inductor/codegen/triton.py`, with runtime config
-  filtering in `torch/_inductor/runtime/triton_heuristics.py`.
-- **Reduction kernels: no dedicated TMA template.**
-  Reductions use the shared Triton codegen path; descriptor legality and
-  minimum block-size constraints are reflected in `tma_min_block_sizes`.
-  Relevant files: `torch/_inductor/codegen/triton.py` and
-  `torch/_inductor/runtime/triton_heuristics.py`.
-- **User-defined Triton kernels: descriptor plumbing exists, but not an
-  Inductor kernel template.** TMA descriptors are passed through
-  `triton_kernel_wrap` metadata and wrapper generation. Relevant files:
-  `torch/_higher_order_ops/triton_kernel_wrap.py`, `torch/_inductor/ir.py`,
-  and `torch/_inductor/codegen/wrapper.py`.
+1. **Plain MM / `addmm`: yes, dedicated persistent TMA template choices.**
+   Relevant files:
+   `torch/_inductor/kernel/templates/triton_persistent_tma_mm.py.jinja`,
+   `torch/_inductor/kernel/templates/triton_blackwell_ws_persistent_device_tma_mm.py.jinja`,
+   registered from `torch/_inductor/kernel/mm.py`.
+2. **Scaled MM: yes, dedicated device-TMA scaled-MM template choices.**
+   These cover epilogue-scaling and main-loop-scaling variants. Relevant files:
+   `torch/_inductor/kernel/templates/triton_epilogue_scaled_mm.py.jinja`,
+   `torch/_inductor/kernel/templates/triton_main_loop_scaled_mm.py.jinja`,
+   registered from `torch/_inductor/kernel/mm.py`.
+3. **Grouped / scaled grouped MM: partial / conditional.**
+   The grouped template has a `USE_TMA_LOAD` path rather than a separate
+   `*_tma*` file. Relevant files:
+   `torch/_inductor/kernel/templates/triton_mm_grouped.py.jinja`, selected from
+   `torch/_inductor/kernel/mm_grouped.py`.
+4. **Flex attention / flex decoding: partial / conditional.**
+   Flex templates are not separate `*_tma*` files, but they have `USE_TMA`
+   branches that create `tl.make_tensor_descriptor(...)` descriptors and use
+   `tl.load_tensor_descriptor(...)`. Relevant files:
+   `torch/_inductor/kernel/flex/templates/flex_attention.py.jinja`,
+   `torch/_inductor/kernel/flex/templates/flex_backwards.py.jinja`,
+   `torch/_inductor/kernel/flex/templates/flex_decode.py.jinja`, and
+   `torch/_inductor/kernel/flex/templates/common.py.jinja`.
+5. **Pointwise kernels: no dedicated TMA template.**
+   Generic Triton codegen can emit tensor descriptors when
+   `config.triton.use_tensor_descriptor` is enabled and legality checks pass.
+   Relevant files: `torch/_inductor/codegen/triton.py`, with runtime config
+   filtering in `torch/_inductor/runtime/triton_heuristics.py`.
+6. **Reduction kernels: no dedicated TMA template.**
+   Reductions use the shared Triton codegen path; descriptor legality and
+   minimum block-size constraints are reflected in `tma_min_block_sizes`.
+   Relevant files: `torch/_inductor/codegen/triton.py` and
+   `torch/_inductor/runtime/triton_heuristics.py`.
+7. **User-defined Triton kernels: descriptor plumbing exists, but not an
+   Inductor kernel template.** TMA descriptors are passed through
+   `triton_kernel_wrap` metadata and wrapper generation. Relevant files:
+   `torch/_higher_order_ops/triton_kernel_wrap.py`, `torch/_inductor/ir.py`,
+   and `torch/_inductor/codegen/wrapper.py`.
 
 So the important distinction is: MM-family paths have true TMA-oriented
 template choices, Flex has TMA branches inside its existing templates, and
