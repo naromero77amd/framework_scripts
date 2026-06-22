@@ -85,6 +85,7 @@ STATE_SKIPPED = "skipped"
 STATE_ERROR = "error"
 STATE_FAILED = "failed"
 STATE_TIMEDOUT = "timedout"
+DISCOVERY_TIMEOUT_SECONDS = 1800
 
 
 def _output_indicates_skipped(stdout: str, stderr: str) -> bool:
@@ -319,6 +320,22 @@ def _parse_pytest_collect_only_quiet(combined_output: str):
     return node_ids
 
 
+def _format_discovery_failure(cmd, returncode, stdout, stderr):
+    """Format all useful discovery failure output for early diagnosis."""
+    msg = f"Discovery failed (exit {returncode}).\n"
+    msg += f"Command: {' '.join(cmd)}\n"
+    msg += "\n--- discovery stdout ---\n"
+    msg += stdout or "(none)\n"
+    if not msg.endswith("\n"):
+        msg += "\n"
+    msg += "\n--- discovery stderr ---\n"
+    msg += stderr or "(none)\n"
+    if not msg.endswith("\n"):
+        msg += "\n"
+    msg += "--- end discovery output ---\n"
+    return msg
+
+
 def discover_tests(pytorch_path, log_file, test_file_rel_paths=None):
     """
     Discover tests by running pytest --collect-only -q (one node id per line).
@@ -346,10 +363,12 @@ def discover_tests(pytorch_path, log_file, test_file_rel_paths=None):
             cwd=str(pytorch_path),
             capture_output=True,
             text=True,
-            timeout=120
+            timeout=DISCOVERY_TIMEOUT_SECONDS,
         )
         if result.returncode != 0:
-            msg = f"Discovery failed (exit {result.returncode}). stderr: {result.stderr or '(none)'}\n"
+            msg = _format_discovery_failure(
+                cmd, result.returncode, result.stdout or "", result.stderr or ""
+            )
             print(msg, end='')
             log_file.write(msg)
             log_file.flush()
@@ -357,14 +376,16 @@ def discover_tests(pytorch_path, log_file, test_file_rel_paths=None):
         combined = (result.stdout or '') + '\n' + (result.stderr or '')
         node_ids = _parse_pytest_collect_only_quiet(combined)
         return node_ids
-    except subprocess.TimeoutExpired:
-        msg = "Discovery timed out.\n"
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+        msg = _format_discovery_failure(cmd, "timeout", stdout, stderr)
         print(msg, end='')
         log_file.write(msg)
         log_file.flush()
         return []
     except Exception as e:
-        msg = f"Discovery error: {e}\n"
+        msg = f"Discovery error: {e}\nCommand: {' '.join(cmd)}\n"
         print(msg, end='')
         log_file.write(msg)
         log_file.flush()
@@ -444,6 +465,50 @@ def read_tests_from_csv(csv_file):
     except Exception as e:
         print(f"Error reading CSV file: {str(e)}")
         sys.exit(1)
+
+
+def discover_inductor_core_files(pytorch_path):
+    """
+    Return the test/ relative file paths for PyTorch's CI inductor_core suite.
+
+    Mirrors .ci/pytorch/test.sh:test_inductor_core, which runs all discovered
+    inductor tests and then applies explicit exclusions.
+    """
+    pytorch_root = Path(pytorch_path)
+    sys.path.insert(0, str(pytorch_root))
+    try:
+        from tools.testing.discover_tests import TESTS
+    finally:
+        try:
+            sys.path.remove(str(pytorch_root))
+        except ValueError:
+            pass
+
+    test_script = pytorch_root / '.ci' / 'pytorch' / 'test.sh'
+    content = test_script.read_text(encoding='utf-8')
+    try:
+        start = content.index('test_inductor_core()')
+        end = content.index('assert_git_not_dirty', start)
+    except ValueError as e:
+        raise RuntimeError(
+            f"Could not find test_inductor_core block in {test_script}"
+        ) from e
+
+    block = content[start:end]
+    excluded = {
+        path[:-3] if path.endswith('.py') else path
+        for path in re.findall(r'inductor/[A-Za-z0-9_/.]+', block)
+    }
+
+    files = [
+        f'{test_name}.py'
+        for test_name in sorted(TESTS)
+        if test_name.startswith('inductor/') and test_name not in excluded
+    ]
+
+    if not files:
+        raise RuntimeError("No inductor_core test files were discovered.")
+    return files
 
 
 # Pattern for "Mode: full_suite" or "Mode: csv" at start of line (after strip)
@@ -665,6 +730,11 @@ def main():
         help='Run all tests in the inductor test suite (no CSV file needed)'
     )
     parser.add_argument(
+        '--include-inductor-tests',
+        action='store_true',
+        help='Add PyTorch CI inductor_core test files from PYTORCH_PATH; implies --all-tests'
+    )
+    parser.add_argument(
         '--rerun-failed',
         metavar='LOG_FILE',
         default=None,
@@ -728,6 +798,16 @@ def main():
 
     args = parser.parse_args()
 
+    if args.include_inductor_tests:
+        args.all_tests = True
+        try:
+            inductor_files = discover_inductor_core_files(args.pytorch_path)
+        except RuntimeError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        args.input_files = list(dict.fromkeys((args.input_files or []) + inductor_files))
+        print(f"Added {len(inductor_files)} inductor_core test file(s).")
+
     # -i only applies to full-suite mode
     if args.input_files is not None and not args.all_tests:
         print("Error: -i/--input-files can only be used with --all-tests")
@@ -782,8 +862,10 @@ def main():
         else:
             args.log_file = f'test_results_{timestamp}.log'
 
-    # In collect-only mode we don't create a log file (use in-memory buffer for any internal writes)
-    log_file = io.StringIO() if args.collect_only else open(args.log_file, 'w', encoding='utf-8')
+    # In collect-only mode we don't create a log file (use in-memory buffer for any internal writes).
+    # Resume appends so previously completed results remain available for final analysis.
+    log_mode = 'a' if args.resume else 'w'
+    log_file = io.StringIO() if args.collect_only else open(args.log_file, log_mode, encoding='utf-8')
 
     try:
         if not args.collect_only:

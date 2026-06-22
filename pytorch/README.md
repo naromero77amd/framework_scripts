@@ -1,6 +1,6 @@
 # PyTorch Unit Test Runner
 
-`run_tests.py` runs PyTorch unit tests. It supports three modes: running tests from a CSV file, running the full discovered test suite (from one or more test files), or re-running only tests that failed (and optionally timed out) from a previous run. By default, full-suite mode uses the inductor test file (`test/inductor/test_torchinductor.py`). Use **`-i`** in full-suite mode to run other test files under `PYTORCH_PATH/test/` (e.g. `-i test_ops.py test_nn.py`).
+`run_tests.py` runs PyTorch unit tests. It supports three modes: running tests from a CSV file, running the full discovered test suite (from one or more test files), or re-running only tests that failed (and optionally timed out) from a previous run. By default, full-suite mode uses the inductor test file (`test/inductor/test_torchinductor.py`). Use **`-i`** in full-suite mode to run other test files under `PYTORCH_PATH/test/` (e.g. `-i test_ops.py test_nn.py`). Use **`--include-inductor-tests`** to add the PyTorch CI `inductor_core` file set automatically.
 
 ## Requirements
 
@@ -16,6 +16,7 @@ You must use exactly one of the following:
 |------|----------------|-------------|
 | **CSV** | Pass a CSV file path as a positional argument | Run only the tests listed in the CSV (column `test_name`). |
 | **Full suite** | `--all-tests` | Discover all tests via `pytest <test_file(s)> --collect-only` and run each one. Use **`-i FILE [FILE ...]`** to specify test files under `PYTORCH_PATH/test/` (e.g. `-i test_ops.py test_nn.py`); default is the inductor test file. Optionally filter by name with `--regex PATTERN`. |
+| **Inductor core** | `--include-inductor-tests` | Full-suite shortcut that adds the CI-derived `inductor_core` test files from the PyTorch checkout. This implies `--all-tests` and can be combined with `-i` to include additional files. |
 | **Rerun failed** | `--rerun-failed LOG_FILE` | Parse a previous run’s log and re-run only tests that **failed** (not timeouts). Add `--rerun-include-timeouts` to also re-run timed-out tests. |
 
 Examples:
@@ -31,6 +32,9 @@ python run_tests.py --pytorch-path /path/to/pytorch --all-tests --regex GPUTests
 # Full-suite mode with specific test files under PYTORCH_PATH/test/
 python run_tests.py --all-tests -i test_ops.py test_nn.py --pytorch-path /path/to/pytorch
 
+# PyTorch CI inductor_core file set
+python run_tests.py --include-inductor-tests --pytorch-path /path/to/pytorch
+
 # Rerun failed tests from a previous log
 python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_20250216_120000.log
 ```
@@ -43,6 +47,7 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 |----------|----------|-------------|
 | `csv_file` | One of CSV / all-tests / rerun-failed | Path to CSV with a `test_name` column. Omit when using `--all-tests` or `--rerun-failed`. |
 | `--all-tests` | One of the three modes | Discover and run all tests in the configured test file. |
+| `--include-inductor-tests` | No | Add PyTorch CI `inductor_core` test files from the checkout at `--pytorch-path`; implies `--all-tests`. The file list is derived from `tools/testing/discover_tests.py` and `.ci/pytorch/test.sh::test_inductor_core`. |
 | `--rerun-failed LOG_FILE` | One of the three modes | Re-run tests that failed; `LOG_FILE` is the log from a previous run. By default timed-out tests are excluded; use `--rerun-include-timeouts` to include them. |
 | `--rerun-include-timeouts` | No | With `--rerun-failed`, also re-run tests that timed out (default: only re-run failed tests). |
 | `--pytorch-path PATH` | Yes | Path to PyTorch directory (must contain the default test file or, with `-i`, each specified file under `test/`). |
@@ -68,7 +73,9 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 ## Full-suite mode (`--all-tests`)
 
 - **Test file(s)**: By default the script uses the inductor test file (`test/inductor/test_torchinductor.py`). Use **`-i FILE [FILE ...]`** to run one or more other test files under `PYTORCH_PATH/test/`. Each argument is a filename or path relative to `test/` (e.g. `-i test_ops.py test_nn.py` runs `test/test_ops.py` and `test/test_nn.py`). `-i` can only be used with `--all-tests`.
+- **Inductor core shortcut**: **`--include-inductor-tests`** derives the same file set as PyTorch CI’s `inductor_core` configuration by reading `tools/testing/discover_tests.py` and `.ci/pytorch/test.sh::test_inductor_core` from `PYTORCH_PATH`. It implies `--all-tests` and appends those files to any files passed with `-i`, de-duplicating the final list.
 - Runs `pytest <test_file(s)> --collect-only -q` to get one full pytest node id per line (e.g. `path::Class::test_method` or `path::Class::test_method[param]`). This gives a **1:1 mapping**: each collected item (including each parametrized variant) is run exactly once.
+- If collection fails, the log includes the collect command, stdout, and stderr so import-time errors are visible.
 - Each test is run with `pytest --timeout <seconds> <node_id>` from the PyTorch path. The timeout is enforced by the **pytest-timeout** plugin (see Requirements).
 - **`--regex PATTERN`**: When given, only tests whose full id matches the regex are run (e.g. `--regex GPUTests` to run only tests whose name contains “GPUTests”). The script reports how many tests match and how many were discovered before filtering. If no tests match, it exits successfully without running any tests.
 
@@ -115,7 +122,7 @@ python run_tests.py --rerun-failed previous.log --pytorch-path /path/to/pytorch 
 
 - By default, after each test the script writes a **checkpoint** file next to the log file: `{log_file_path}.checkpoint`.
 - The checkpoint stores the last test run, the next test to run, indices, mode, and (when applicable) CSV path and PyTorch path.
-- Use **`--resume`** with the **same log file path** (and, if you let the script choose the log name, the same generated name) to continue from the next test. If the run had already completed (no “next” test), the script starts from the first test again.
+- Use **`--resume`** with the **same log file path** (and, if you let the script choose the log name, the same generated name) to continue from the next test. Resume appends to the existing log so previous results remain available for final analysis. If the run had already completed (no “next” test), the script starts from the first test again.
 - If a checkpoint exists and you run **without** `--resume`, the script reports the checkpoint state and deletes it, then starts from the first test.
 - Use **`--no-checkpoint`** to disable writing and using checkpoints.
 
@@ -167,6 +174,9 @@ python run_tests.py --all-tests --pytorch-path /path/to/pytorch --regex GPUTests
 
 # Run full suite from specific test files under test/
 python run_tests.py --all-tests -i test_ops.py test_nn.py --pytorch-path /path/to/pytorch
+
+# Run the PyTorch CI inductor_core file set
+python run_tests.py --include-inductor-tests --pytorch-path /path/to/pytorch
 
 # Resume a previous run (same log file path)
 python run_tests.py --all-tests --pytorch-path /path/to/pytorch --log-file full_run.log --resume
