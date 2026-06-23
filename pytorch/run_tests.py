@@ -15,6 +15,15 @@ from pathlib import Path
 
 # Relative path to the test file (under PyTorch root); used in run_test, discover_tests, main
 TEST_FILE_REL_PATH = 'test/inductor/test_torchinductor.py'
+TRITON_NIGHTLY_INDUCTOR_FILES = [
+    'inductor/test_torchinductor.py',
+    'inductor/test_flex_attention.py',
+    'inductor/test_max_autotune.py',
+    'inductor/test_aot_inductor.py',
+    'inductor/test_flex_decoding.py',
+    'inductor/test_torchinductor_codegen_dynamic_shapes.py',
+    'inductor/test_torchinductor_opinfo.py',
+]
 
 
 def _require_rocm_home():
@@ -511,6 +520,11 @@ def discover_inductor_core_files(pytorch_path):
     return files
 
 
+def triton_nightly_inductor_files():
+    """Return the torch-triton-nightly Inductor validation file set."""
+    return TRITON_NIGHTLY_INDUCTOR_FILES[:]
+
+
 # Pattern for "Mode: full_suite" or "Mode: csv" at start of line (after strip)
 MODE_LINE_RE = re.compile(r'^Mode:\s*(full_suite|csv)\s*$')
 # Pattern for "  - test_name (12.34s)" in Failed tests section
@@ -730,9 +744,16 @@ def main():
         help='Run all tests in the inductor test suite (no CSV file needed)'
     )
     parser.add_argument(
+        '--include-inductor-all-tests',
         '--include-inductor-tests',
         action='store_true',
+        dest='include_inductor_all_tests',
         help='Add PyTorch CI inductor_core test files from PYTORCH_PATH; implies --all-tests'
+    )
+    parser.add_argument(
+        '--include-triton-nightly-inductor-tests',
+        action='store_true',
+        help='Add the ROCm torch-triton-nightly Inductor validation test files; implies --all-tests'
     )
     parser.add_argument(
         '--rerun-failed',
@@ -798,7 +819,7 @@ def main():
 
     args = parser.parse_args()
 
-    if args.include_inductor_tests:
+    if args.include_inductor_all_tests:
         args.all_tests = True
         try:
             inductor_files = discover_inductor_core_files(args.pytorch_path)
@@ -807,6 +828,12 @@ def main():
             sys.exit(1)
         args.input_files = list(dict.fromkeys((args.input_files or []) + inductor_files))
         print(f"Added {len(inductor_files)} inductor_core test file(s).")
+
+    if args.include_triton_nightly_inductor_tests:
+        args.all_tests = True
+        triton_files = triton_nightly_inductor_files()
+        args.input_files = list(dict.fromkeys((args.input_files or []) + triton_files))
+        print(f"Added {len(triton_files)} torch-triton-nightly inductor test file(s).")
 
     # -i only applies to full-suite mode
     if args.input_files is not None and not args.all_tests:

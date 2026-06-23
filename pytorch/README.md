@@ -1,6 +1,6 @@
 # PyTorch Unit Test Runner
 
-`run_tests.py` runs PyTorch unit tests. It supports three modes: running tests from a CSV file, running the full discovered test suite (from one or more test files), or re-running only tests that failed (and optionally timed out) from a previous run. By default, full-suite mode uses the inductor test file (`test/inductor/test_torchinductor.py`). Use **`-i`** in full-suite mode to run other test files under `PYTORCH_PATH/test/` (e.g. `-i test_ops.py test_nn.py`). Use **`--include-inductor-tests`** to add the PyTorch CI `inductor_core` file set automatically.
+`run_tests.py` runs PyTorch unit tests. It supports three modes: running tests from a CSV file, running the full discovered test suite (from one or more test files), or re-running only tests that failed (and optionally timed out) from a previous run. By default, full-suite mode uses the inductor test file (`test/inductor/test_torchinductor.py`). Use **`-i`** in full-suite mode to run other test files under `PYTORCH_PATH/test/` (e.g. `-i test_ops.py test_nn.py`). Use **`--include-inductor-all-tests`** to add the PyTorch CI `inductor_core` file set automatically, or **`--include-triton-nightly-inductor-tests`** to add the smaller ROCm torch-triton-nightly Inductor subset.
 
 ## Requirements
 
@@ -16,7 +16,8 @@ You must use exactly one of the following:
 |------|----------------|-------------|
 | **CSV** | Pass a CSV file path as a positional argument | Run only the tests listed in the CSV (column `test_name`). |
 | **Full suite** | `--all-tests` | Discover all tests via `pytest <test_file(s)> --collect-only` and run each one. Use **`-i FILE [FILE ...]`** to specify test files under `PYTORCH_PATH/test/` (e.g. `-i test_ops.py test_nn.py`); default is the inductor test file. Optionally filter by name with `--regex PATTERN`. |
-| **Inductor core** | `--include-inductor-tests` | Full-suite shortcut that adds the CI-derived `inductor_core` test files from the PyTorch checkout. This implies `--all-tests` and can be combined with `-i` to include additional files. |
+| **Inductor all** | `--include-inductor-all-tests` | Full-suite shortcut that adds the CI-derived `inductor_core` test files from the PyTorch checkout. This implies `--all-tests` and can be combined with `-i` to include additional files. |
+| **Triton nightly Inductor** | `--include-triton-nightly-inductor-tests` | Full-suite shortcut that adds the smaller ROCm torch-triton-nightly Inductor validation subset. This implies `--all-tests` and can be combined with `-i` to include additional files. |
 | **Rerun failed** | `--rerun-failed LOG_FILE` | Parse a previous run’s log and re-run only tests that **failed** (not timeouts). Add `--rerun-include-timeouts` to also re-run timed-out tests. |
 
 Examples:
@@ -33,7 +34,10 @@ python run_tests.py --pytorch-path /path/to/pytorch --all-tests --regex GPUTests
 python run_tests.py --all-tests -i test_ops.py test_nn.py --pytorch-path /path/to/pytorch
 
 # PyTorch CI inductor_core file set
-python run_tests.py --include-inductor-tests --pytorch-path /path/to/pytorch
+python run_tests.py --include-inductor-all-tests --pytorch-path /path/to/pytorch
+
+# ROCm torch-triton-nightly Inductor validation subset
+python run_tests.py --include-triton-nightly-inductor-tests --pytorch-path /path/to/pytorch
 
 # Rerun failed tests from a previous log
 python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_20250216_120000.log
@@ -47,7 +51,9 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 |----------|----------|-------------|
 | `csv_file` | One of CSV / all-tests / rerun-failed | Path to CSV with a `test_name` column. Omit when using `--all-tests` or `--rerun-failed`. |
 | `--all-tests` | One of the three modes | Discover and run all tests in the configured test file. |
-| `--include-inductor-tests` | No | Add PyTorch CI `inductor_core` test files from the checkout at `--pytorch-path`; implies `--all-tests`. The file list is derived from `tools/testing/discover_tests.py` and `.ci/pytorch/test.sh::test_inductor_core`. |
+| `--include-inductor-all-tests` | No | Add PyTorch CI `inductor_core` test files from the checkout at `--pytorch-path`; implies `--all-tests`. The file list is derived from `tools/testing/discover_tests.py` and `.ci/pytorch/test.sh::test_inductor_core`. |
+| `--include-inductor-tests` | No | Backward-compatible alias for `--include-inductor-all-tests`. |
+| `--include-triton-nightly-inductor-tests` | No | Add the ROCm torch-triton-nightly Inductor validation files; implies `--all-tests`. The file list mirrors `pytorch-ci-scripts/torch-triton-nightly/inductor-tests.py`. |
 | `--rerun-failed LOG_FILE` | One of the three modes | Re-run tests that failed; `LOG_FILE` is the log from a previous run. By default timed-out tests are excluded; use `--rerun-include-timeouts` to include them. |
 | `--rerun-include-timeouts` | No | With `--rerun-failed`, also re-run tests that timed out (default: only re-run failed tests). |
 | `--pytorch-path PATH` | Yes | Path to PyTorch directory (must contain the default test file or, with `-i`, each specified file under `test/`). |
@@ -73,7 +79,8 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 ## Full-suite mode (`--all-tests`)
 
 - **Test file(s)**: By default the script uses the inductor test file (`test/inductor/test_torchinductor.py`). Use **`-i FILE [FILE ...]`** to run one or more other test files under `PYTORCH_PATH/test/`. Each argument is a filename or path relative to `test/` (e.g. `-i test_ops.py test_nn.py` runs `test/test_ops.py` and `test/test_nn.py`). `-i` can only be used with `--all-tests`.
-- **Inductor core shortcut**: **`--include-inductor-tests`** derives the same file set as PyTorch CI’s `inductor_core` configuration by reading `tools/testing/discover_tests.py` and `.ci/pytorch/test.sh::test_inductor_core` from `PYTORCH_PATH`. It implies `--all-tests` and appends those files to any files passed with `-i`, de-duplicating the final list.
+- **Inductor all shortcut**: **`--include-inductor-all-tests`** derives the same file set as PyTorch CI’s `inductor_core` configuration by reading `tools/testing/discover_tests.py` and `.ci/pytorch/test.sh::test_inductor_core` from `PYTORCH_PATH`. It implies `--all-tests` and appends those files to any files passed with `-i`, de-duplicating the final list. **`--include-inductor-tests`** remains as a backward-compatible alias.
+- **Triton nightly Inductor shortcut**: **`--include-triton-nightly-inductor-tests`** adds the seven test files used by ROCm’s `pytorch-ci-scripts/torch-triton-nightly/inductor-tests.py`: `inductor/test_torchinductor.py`, `inductor/test_flex_attention.py`, `inductor/test_max_autotune.py`, `inductor/test_aot_inductor.py`, `inductor/test_flex_decoding.py`, `inductor/test_torchinductor_codegen_dynamic_shapes.py`, and `inductor/test_torchinductor_opinfo.py`.
 - Runs `pytest <test_file(s)> --collect-only -q` to get one full pytest node id per line (e.g. `path::Class::test_method` or `path::Class::test_method[param]`). This gives a **1:1 mapping**: each collected item (including each parametrized variant) is run exactly once.
 - If collection fails, the log includes the collect command, stdout, and stderr so import-time errors are visible.
 - Each test is run with `pytest --timeout <seconds> <node_id>` from the PyTorch path. The timeout is enforced by the **pytest-timeout** plugin (see Requirements).
@@ -176,7 +183,10 @@ python run_tests.py --all-tests --pytorch-path /path/to/pytorch --regex GPUTests
 python run_tests.py --all-tests -i test_ops.py test_nn.py --pytorch-path /path/to/pytorch
 
 # Run the PyTorch CI inductor_core file set
-python run_tests.py --include-inductor-tests --pytorch-path /path/to/pytorch
+python run_tests.py --include-inductor-all-tests --pytorch-path /path/to/pytorch
+
+# Run the ROCm torch-triton-nightly Inductor validation subset
+python run_tests.py --include-triton-nightly-inductor-tests --pytorch-path /path/to/pytorch
 
 # Resume a previous run (same log file path)
 python run_tests.py --all-tests --pytorch-path /path/to/pytorch --log-file full_run.log --resume
