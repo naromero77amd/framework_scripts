@@ -9,9 +9,11 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 # Relative path to the test file (under PyTorch root); used in run_test, discover_tests, main
 TEST_FILE_REL_PATH = 'test/inductor/test_torchinductor.py'
@@ -95,6 +97,10 @@ STATE_ERROR = "error"
 STATE_FAILED = "failed"
 STATE_TIMEDOUT = "timedout"
 DISCOVERY_TIMEOUT_SECONDS = 1800
+DEFAULT_PER_TEST_TIMEOUT_SECONDS = 300
+DEFAULT_PER_FILE_TIMEOUT_SECONDS = 1800
+BATCH_MODE_FILE = "file"
+BATCH_MODE_TEST = "test"
 
 
 def _output_indicates_skipped(stdout: str, stderr: str) -> bool:
@@ -158,8 +164,15 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
     log_file.flush()
     
     start_time = time.time()
-    run_kw = dict(env=env, capture_output=True, text=True, cwd=str(pytorch_path))
-    # No subprocess timeout; pytest-timeout handles per-test timeout for both modes.
+    # pytest-timeout should interrupt test-level hangs; the subprocess timeout is
+    # a final safety net for cases where the test process does not exit cleanly.
+    run_kw = dict(
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd=str(pytorch_path),
+        timeout=timeout + 60,
+    )
 
     try:
         result = subprocess.run(cmd, **run_kw)
@@ -229,6 +242,168 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         log_file.write(error_msg)
         log_file.flush()
         return False, elapsed_time, False, STATE_ERROR
+
+
+def _node_file(node_id: str) -> str:
+    """Return the test file portion of a pytest node id."""
+    return node_id.split("::", 1)[0]
+
+
+def _group_node_ids_by_file(test_names):
+    """Group pytest node ids by file while preserving discovery order."""
+    groups = []
+    current_file = None
+    current_nodes = []
+    for node_id in test_names:
+        file_name = _node_file(node_id)
+        if current_file is None:
+            current_file = file_name
+        if file_name != current_file:
+            groups.append((current_file, current_nodes))
+            current_file = file_name
+            current_nodes = []
+        current_nodes.append(node_id)
+    if current_file is not None:
+        groups.append((current_file, current_nodes))
+    return groups
+
+
+def _parse_junit_testcases(junit_path):
+    """
+    Return per-testcase states from pytest's JUnit XML in execution order.
+
+    Each item is (state, elapsed). State is one of passed, skipped, failed, error.
+    """
+    try:
+        root = ET.parse(junit_path).getroot()
+    except (ET.ParseError, OSError):
+        return []
+
+    cases = []
+    for testcase in root.iter("testcase"):
+        elapsed = float(testcase.attrib.get("time", "0") or 0)
+        if testcase.find("skipped") is not None:
+            state = STATE_SKIPPED
+        elif testcase.find("error") is not None:
+            state = STATE_ERROR
+        elif testcase.find("failure") is not None:
+            state = STATE_FAILED
+        else:
+            state = STATE_PASSED
+        cases.append((state, elapsed))
+    return cases
+
+
+def _write_result_status(log_file, state, elapsed):
+    status_map = {
+        STATE_PASSED: "✓ PASSED",
+        STATE_SKIPPED: "✓ SKIPPED",
+        STATE_ERROR: "✗ ERROR",
+        STATE_FAILED: "✗ FAILED",
+        STATE_TIMEDOUT: "✗ TIMEDOUT",
+    }
+    status_msg = f"{status_map[state]} ({elapsed:.2f}s)\n"
+    print(status_msg, end='')
+    log_file.write(status_msg)
+    log_file.flush()
+
+
+def _record_file_batch_result(node_id, state, elapsed, log_file, index, total):
+    progress_msg = f"[{index}/{total}] "
+    header = f"\n{'='*70}\nRunning: {node_id}\n{'='*70}\n"
+    print(progress_msg, end='')
+    print(header, end='')
+    log_file.write(progress_msg)
+    log_file.write(header)
+    _write_result_status(log_file, state, elapsed)
+    return {
+        'name': node_id,
+        'success': state in (STATE_PASSED, STATE_SKIPPED),
+        'time': elapsed,
+        'timed_out': state == STATE_TIMEDOUT,
+        'state': state,
+    }
+
+
+def _run_file_batch(file_name, node_ids, args, log_file):
+    """
+    Run one file (or a filtered set of nodes from one file) in one pytest process.
+    Returns (results, needs_fallback, elapsed).
+    """
+    env = _build_test_env()
+    targets = node_ids if args.regex else [file_name]
+    with tempfile.TemporaryDirectory(prefix="run_tests_junit_") as tmpdir:
+        junit_path = Path(tmpdir) / "pytest.xml"
+        cmd = ['pytest'] + targets + ['--junitxml', str(junit_path)]
+        header = (
+            f"\n{'='*70}\n"
+            f"Running file batch: {file_name} ({len(node_ids)} collected test(s))\n"
+            f"{'='*70}\n"
+        )
+        print(header, end='')
+        log_file.write(header)
+        log_file.flush()
+
+        start_time = time.time()
+        try:
+            result = subprocess.run(
+                cmd,
+                env=env,
+                capture_output=True,
+                text=True,
+                cwd=str(args.pytorch_path),
+                timeout=args.per_file_timeout,
+            )
+            elapsed = time.time() - start_time
+        except subprocess.TimeoutExpired as e:
+            elapsed = time.time() - start_time
+            msg = f"✗ FILE TIMEDOUT ({file_name}) after {elapsed:.2f}s (limit: {args.per_file_timeout}s)\n"
+            print(msg, end='')
+            log_file.write(msg)
+            try:
+                if e.stdout:
+                    log_file.write(e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout)
+                if e.stderr:
+                    log_file.write(e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr)
+            except (AttributeError, TypeError):
+                pass
+            log_file.flush()
+            return [], True, elapsed
+
+        if result.stdout:
+            log_file.write(result.stdout)
+        if result.stderr:
+            log_file.write(result.stderr)
+        log_file.flush()
+
+        if result.returncode != 0:
+            msg = f"✗ FILE FAILED ({file_name}) with exit code {result.returncode} ({elapsed:.2f}s)\n"
+            print(msg, end='')
+            log_file.write(msg)
+            log_file.flush()
+            return [], True, elapsed
+
+        testcase_states = _parse_junit_testcases(junit_path)
+        if len(testcase_states) != len(node_ids):
+            msg = (
+                f"✗ FILE RESULT MISMATCH ({file_name}): collected {len(node_ids)} node(s), "
+                f"but JUnit reported {len(testcase_states)} testcase(s). Falling back to per-test.\n"
+            )
+            print(msg, end='')
+            log_file.write(msg)
+            log_file.flush()
+            return [], True, elapsed
+
+        results = []
+        for node_id, (state, test_elapsed) in zip(node_ids, testcase_states):
+            results.append({
+                'name': node_id,
+                'success': state in (STATE_PASSED, STATE_SKIPPED),
+                'time': test_elapsed,
+                'timed_out': False,
+                'state': state,
+            })
+        return results, False, elapsed
 
 
 # Pytest node ID line (from --collect-only -q): path::Class::test_method or path::test_method[param]
@@ -633,64 +808,7 @@ def _resolve_start_index(test_names, log_file_path, resume, no_checkpoint, log_f
     return start_index
 
 
-def _run_test_batch(test_names, start_index, args, log_file, mode, by_id, count_msg, summary_title):
-    """
-    Run tests from start_index to end, write checkpoints, print summary.
-    Returns exit code (0 if all passed, 1 otherwise).
-    """
-    msg = f"{count_msg}\n\n"
-    print(msg, end='')
-    log_file.write(msg)
-    log_file.flush()
-
-    results = []
-    start_time = time.time()
-    for i in range(start_index, len(test_names)):
-        test_name = test_names[i]
-        idx_display = i + 1
-        progress_msg = f"[{idx_display}/{len(test_names)}] "
-        print(progress_msg, end='')
-        log_file.write(progress_msg)
-        log_file.flush()
-        timed_out = False
-        state = STATE_FAILED
-        try:
-            success, elapsed, timed_out, state = run_test(
-                test_name, args.pytorch_path, log_file,
-                timeout=args.per_test_timeout,
-                by_id=by_id
-            )
-        except subprocess.TimeoutExpired:
-            elapsed = float(args.per_test_timeout)
-            timeout_msg = f"✗ TIMEOUT (uncaught in run_test) after {elapsed:.2f}s\n"
-            print(timeout_msg, end='')
-            log_file.write(timeout_msg)
-            log_file.flush()
-            success, elapsed, state = False, elapsed, STATE_TIMEDOUT
-            timed_out = True
-        except Exception as e:
-            err_msg = f"✗ ERROR (uncaught): {type(e).__name__}: {e}\n"
-            print(err_msg, end='')
-            log_file.write(err_msg)
-            log_file.flush()
-            success, elapsed, state = False, 0.0, STATE_ERROR
-        results.append({
-            'name': test_name, 'success': success, 'time': elapsed,
-            'timed_out': timed_out, 'state': state,
-        })
-        if not args.no_checkpoint:
-            next_test = test_names[i + 1] if i + 1 < len(test_names) else None
-            write_checkpoint(
-                args.log_file, test_name, next_test, i, len(test_names), mode,
-                csv_file=args.csv_file, pytorch_path=args.pytorch_path
-            )
-        if not success and args.stop_on_failure:
-            stop_msg = f"\nStopping due to test failure: {test_name}\n"
-            print(stop_msg, end='')
-            log_file.write(stop_msg)
-            log_file.flush()
-            break
-
+def _write_run_summary(results, start_time, log_file, summary_title):
     total_time = time.time() - start_time
     passed = sum(1 for r in results if r.get('state') == STATE_PASSED)
     skipped_count = sum(1 for r in results if r.get('state') == STATE_SKIPPED)
@@ -723,6 +841,135 @@ def _run_test_batch(test_names, start_index, args, log_file, mode, by_id, count_
     log_file.flush()
     any_bad = error_count > 0 or failed_count > 0 or timedout_count > 0
     return 0 if not any_bad else 1
+
+
+def _run_one_test_with_progress(test_name, index, total, args, log_file, by_id, timeout):
+    progress_msg = f"[{index}/{total}] "
+    print(progress_msg, end='')
+    log_file.write(progress_msg)
+    log_file.flush()
+    timed_out = False
+    state = STATE_FAILED
+    try:
+        success, elapsed, timed_out, state = run_test(
+            test_name, args.pytorch_path, log_file,
+            timeout=timeout,
+            by_id=by_id
+        )
+    except subprocess.TimeoutExpired:
+        elapsed = float(timeout)
+        timeout_msg = f"✗ TIMEOUT (uncaught in run_test) after {elapsed:.2f}s\n"
+        print(timeout_msg, end='')
+        log_file.write(timeout_msg)
+        log_file.flush()
+        success, elapsed, state = False, elapsed, STATE_TIMEDOUT
+        timed_out = True
+    except Exception as e:
+        err_msg = f"✗ ERROR (uncaught): {type(e).__name__}: {e}\n"
+        print(err_msg, end='')
+        log_file.write(err_msg)
+        log_file.flush()
+        success, elapsed, state = False, 0.0, STATE_ERROR
+    return {
+        'name': test_name, 'success': success, 'time': elapsed,
+        'timed_out': timed_out, 'state': state,
+    }
+
+
+def _run_test_batch(test_names, start_index, args, log_file, mode, by_id, count_msg, summary_title):
+    """
+    Run tests from start_index to end, write checkpoints, print summary.
+    Returns exit code (0 if all passed, 1 otherwise).
+    """
+    msg = f"{count_msg}\n\n"
+    print(msg, end='')
+    log_file.write(msg)
+    log_file.flush()
+
+    results = []
+    start_time = time.time()
+    timeout = args.per_test_timeout or DEFAULT_PER_TEST_TIMEOUT_SECONDS
+    for i in range(start_index, len(test_names)):
+        test_name = test_names[i]
+        result = _run_one_test_with_progress(
+            test_name, i + 1, len(test_names), args, log_file, by_id, timeout
+        )
+        results.append(result)
+        if not args.no_checkpoint:
+            next_test = test_names[i + 1] if i + 1 < len(test_names) else None
+            write_checkpoint(
+                args.log_file, test_name, next_test, i, len(test_names), mode,
+                csv_file=args.csv_file, pytorch_path=args.pytorch_path
+            )
+        if not result['success'] and args.stop_on_failure:
+            stop_msg = f"\nStopping due to test failure: {test_name}\n"
+            print(stop_msg, end='')
+            log_file.write(stop_msg)
+            log_file.flush()
+            break
+
+    return _write_run_summary(results, start_time, log_file, summary_title)
+
+
+def _run_file_batch_mode(test_names, start_index, args, log_file, mode, count_msg, summary_title):
+    """
+    Run discovered pytest node ids grouped by file. Failed or timed-out files
+    fall back to per-test-node execution for exact attribution.
+    """
+    msg = f"{count_msg}\n\n"
+    print(msg, end='')
+    log_file.write(msg)
+    log_file.flush()
+
+    results = []
+    start_time = time.time()
+    groups = _group_node_ids_by_file(test_names[start_index:])
+    node_index = start_index
+    fallback_timeout = DEFAULT_PER_TEST_TIMEOUT_SECONDS
+
+    for file_name, node_ids in groups:
+        file_results, needs_fallback, _ = _run_file_batch(file_name, node_ids, args, log_file)
+        if needs_fallback:
+            fallback_msg = (
+                f"\nFalling back to per-test execution for {file_name} "
+                f"({len(node_ids)} collected test(s)).\n"
+            )
+            print(fallback_msg, end='')
+            log_file.write(fallback_msg)
+            log_file.flush()
+            for node_id in node_ids:
+                result = _run_one_test_with_progress(
+                    node_id, node_index + 1, len(test_names),
+                    args, log_file, by_id=True, timeout=fallback_timeout
+                )
+                results.append(result)
+                node_index += 1
+                if not result['success'] and args.stop_on_failure:
+                    stop_msg = f"\nStopping due to test failure: {node_id}\n"
+                    print(stop_msg, end='')
+                    log_file.write(stop_msg)
+                    log_file.flush()
+                    break
+        else:
+            for result in file_results:
+                node_index += 1
+                recorded = _record_file_batch_result(
+                    result['name'], result['state'], result['time'],
+                    log_file, node_index, len(test_names)
+                )
+                results.append(recorded)
+        checkpoint_index = node_index - 1
+        if not args.no_checkpoint and checkpoint_index >= 0:
+            last_test = test_names[checkpoint_index]
+            next_test = test_names[node_index] if node_index < len(test_names) else None
+            write_checkpoint(
+                args.log_file, last_test, next_test, checkpoint_index, len(test_names), mode,
+                csv_file=args.csv_file, pytorch_path=args.pytorch_path
+            )
+        if args.stop_on_failure and any(not r['success'] for r in results[-len(node_ids):]):
+            break
+
+    return _write_run_summary(results, start_time, log_file, summary_title)
 
 
 def main():
@@ -784,9 +1031,22 @@ def main():
     parser.add_argument(
         '--per-test-timeout',
         type=int,
-        default=300,
+        default=None,
         metavar='SECONDS',
-        help='Per-test timeout in seconds for CSV and full-suite mode (default: 300)'
+        help='Per-test timeout in seconds for --batch-mode test, CSV, and rerun modes (default: 300)'
+    )
+    parser.add_argument(
+        '--batch-mode',
+        choices=[BATCH_MODE_FILE, BATCH_MODE_TEST],
+        default=BATCH_MODE_FILE,
+        help='Full-suite execution granularity: file batches by default, or one subprocess per pytest node with test'
+    )
+    parser.add_argument(
+        '--per-file-timeout',
+        type=int,
+        default=DEFAULT_PER_FILE_TIMEOUT_SECONDS,
+        metavar='SECONDS',
+        help='Per-file subprocess timeout in seconds for --batch-mode file (default: 1800)'
     )
     parser.add_argument(
         '--resume',
@@ -872,6 +1132,12 @@ def main():
         sys.exit(1)
     if args.regex and not args.all_tests:
         print("Warning: --regex only applies to full-suite mode (--all-tests); ignoring --regex.\n")
+    if args.all_tests and args.batch_mode == BATCH_MODE_FILE and args.per_test_timeout is not None:
+        print("Error: --per-test-timeout can only be used with --batch-mode test.")
+        print("Use --per-file-timeout for --batch-mode file.")
+        sys.exit(1)
+    if args.per_test_timeout is None:
+        args.per_test_timeout = DEFAULT_PER_TEST_TIMEOUT_SECONDS
 
     # Inductor ROCm tests require ROCM_HOME to be set in the user environment.
     try:
@@ -989,11 +1255,24 @@ def main():
                             test_names, args.log_file, args.resume, args.no_checkpoint, log_file,
                             "not in discovered list"
                         )
-                        count_msg = f"Running {len(test_names)} test(s) (filtered). Per-test timeout: {args.per_test_timeout}s"
-                        exit_code = _run_test_batch(
-                            test_names, start_index, args, log_file, mode, by_id=True,
-                            count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
-                        )
+                        if args.batch_mode == BATCH_MODE_FILE:
+                            count_msg = (
+                                f"Running {len(test_names)} test(s) (filtered) in file batches. "
+                                f"Per-file timeout: {args.per_file_timeout}s"
+                            )
+                            exit_code = _run_file_batch_mode(
+                                test_names, start_index, args, log_file, mode,
+                                count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
+                            )
+                        else:
+                            count_msg = (
+                                f"Running {len(test_names)} test(s) (filtered). "
+                                f"Per-test timeout: {args.per_test_timeout}s"
+                            )
+                            exit_code = _run_test_batch(
+                                test_names, start_index, args, log_file, mode, by_id=True,
+                                count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
+                            )
                 else:
                     if args.collect_only:
                         _do_collect_only_and_exit(args.pytorch_path, test_names, by_id=True)
@@ -1002,11 +1281,21 @@ def main():
                         test_names, args.log_file, args.resume, args.no_checkpoint, log_file,
                         "not in discovered list"
                     )
-                    count_msg = f"Found {len(test_names)} test(s). Per-test timeout: {args.per_test_timeout}s"
-                    exit_code = _run_test_batch(
-                        test_names, start_index, args, log_file, mode, by_id=True,
-                        count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
-                    )
+                    if args.batch_mode == BATCH_MODE_FILE:
+                        count_msg = (
+                            f"Found {len(test_names)} test(s). Running in file batches. "
+                            f"Per-file timeout: {args.per_file_timeout}s"
+                        )
+                        exit_code = _run_file_batch_mode(
+                            test_names, start_index, args, log_file, mode,
+                            count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
+                        )
+                    else:
+                        count_msg = f"Found {len(test_names)} test(s). Per-test timeout: {args.per_test_timeout}s"
+                        exit_code = _run_test_batch(
+                            test_names, start_index, args, log_file, mode, by_id=True,
+                            count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
+                        )
         else:
             # CSV mode: read test names and run each one (pytest -k, same as full-suite for execution)
             ensure_pytest_and_timeout_installed()
