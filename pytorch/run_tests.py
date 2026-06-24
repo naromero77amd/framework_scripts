@@ -1112,7 +1112,6 @@ def main():
     )
     parser.add_argument(
         '--include-inductor-all-tests',
-        '--include-inductor-tests',
         action='store_true',
         dest='include_inductor_all_tests',
         help='Add PyTorch CI inductor_core test files from PYTORCH_PATH; implies --all-tests'

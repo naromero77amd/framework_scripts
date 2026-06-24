@@ -71,7 +71,6 @@ Full-suite mode starts from a list of files under `PYTORCH_PATH/test/`.
 - **Default**: Without `-i` or a shortcut, the script uses `test/inductor/test_torchinductor.py`.
 - **Explicit files**: Use `-i FILE [FILE ...]` to provide files relative to `test/`, such as `-i test_ops.py inductor/test_config.py`.
 - **Inductor all shortcut**: `--include-inductor-all-tests` derives the same file set as PyTorch CI's `inductor_core` configuration by reading `tools/testing/discover_tests.py` and `.ci/pytorch/test.sh::test_inductor_core` from `PYTORCH_PATH`. It implies `--all-tests` and appends those files to any files passed with `-i`, de-duplicating the final list.
-- **Backward-compatible alias**: `--include-inductor-tests` is an alias for `--include-inductor-all-tests`.
 - **Triton nightly Inductor shortcut**: `--include-triton-nightly-inductor-tests` adds the seven files used by ROCm's `pytorch-ci-scripts/torch-triton-nightly/inductor-tests.py`:
   - `inductor/test_torchinductor.py`
   - `inductor/test_flex_attention.py`
@@ -191,7 +190,6 @@ Each test is classified into exactly one state:
 | `csv_file` | One of CSV / full-suite / rerun-failed | Path to CSV with a `test_name` column. Omit when using `--all-tests` or `--rerun-failed`. |
 | `--all-tests` | One of CSV / full-suite / rerun-failed | Discover and run tests in the configured full-suite file list. |
 | `--include-inductor-all-tests` | No | Add PyTorch CI `inductor_core` test files from `--pytorch-path`; implies `--all-tests`. |
-| `--include-inductor-tests` | No | Backward-compatible alias for `--include-inductor-all-tests`. |
 | `--include-triton-nightly-inductor-tests` | No | Add ROCm torch-triton-nightly Inductor validation files; implies `--all-tests`. |
 | `--rerun-failed LOG_FILE` | One of CSV / full-suite / rerun-failed | Rerun failed tests from a previous log. |
 | `--rerun-include-timeouts` | No | With `--rerun-failed`, also rerun timed-out tests. |
