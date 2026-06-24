@@ -86,9 +86,23 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 - Runs `pytest <test_file(s)> --collect-only -q` to get one full pytest node id per line (e.g. `path::Class::test_method` or `path::Class::test_method[param]`). This gives a discovered test list for filtering, reporting, fallback, and resume.
 - If collection fails, the log includes the collect command, stdout, and stderr so import-time errors are visible.
 - **Default file mode**: `--batch-mode file` runs one pytest subprocess per test file with `--per-file-timeout` enforced by the outer subprocess timeout. Passing files are parsed with JUnit XML so per-test pass/skip/fail/error counts remain available.
-- **Fallback in file mode**: If a file subprocess fails or times out, that file’s discovered node ids are rerun individually using the existing per-test path to identify exact failing or timed-out tests.
 - **Per-test mode**: `--batch-mode test` runs each discovered pytest node with `pytest --timeout <seconds> <node_id>` from the PyTorch path. The timeout is enforced by the **pytest-timeout** plugin (see Requirements), with an outer subprocess timeout as a safety net if the pytest process does not exit cleanly.
 - **`--regex PATTERN`**: When given, only tests whose full id matches the regex are run (e.g. `--regex GPUTests` to run only tests whose name contains “GPUTests”). The script reports how many tests match and how many were discovered before filtering. If no tests match, it exits successfully without running any tests.
+
+---
+
+## File-mode fallback behavior
+
+`--batch-mode file` is optimized for speed, but it still tries to preserve per-test attribution when a file has problems.
+
+- Passing files are recorded from pytest's JUnit XML output. The summary still includes per-test PASS/SKIP/FAIL/ERROR counts.
+- If a file subprocess returns a non-zero exit code, the script reruns that file's discovered pytest node ids one at a time with the per-test runner.
+- If a file subprocess exceeds `--per-file-timeout`, the script marks the file batch as timed out, then reruns that file's discovered pytest node ids one at a time.
+- Fallback reruns use the existing per-test path and the default per-test timeout of 300 seconds. The per-test runner also has an outer subprocess timeout safety net of timeout + 60 seconds for cases where pytest-timeout does not terminate a stuck process cleanly.
+- Fallback starts from the beginning of the affected file's discovered node list. The file-level run does not know which internal test was last healthy before a file-level failure or timeout.
+- Checkpoints are written after file batches or fallback reruns so interrupted runs can continue from the next discovered test.
+
+This means file mode is fast for files that pass cleanly, while failures and timeouts are expanded into exact per-test results.
 
 ---
 
