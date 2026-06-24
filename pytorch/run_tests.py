@@ -294,6 +294,52 @@ def _parse_junit_testcases(junit_path):
     return cases
 
 
+def _running_nodes_from_output(output: str):
+    """Best-effort extraction of pytest node ids from verbose output."""
+    nodes = []
+    for line in (output or "").splitlines():
+        stripped = line.strip()
+        if not stripped or "::" not in stripped:
+            continue
+        candidate = stripped.split()[0]
+        if _NODE_ID_LINE_RE.match(candidate):
+            nodes.append(candidate)
+    return nodes
+
+
+def _parse_verbose_node_results(output: str):
+    """Parse completed pytest node states from -vv output."""
+    results = []
+    state_map = {
+        "PASSED": STATE_PASSED,
+        "SKIPPED": STATE_SKIPPED,
+        "FAILED": STATE_FAILED,
+        "ERROR": STATE_ERROR,
+        "XFAIL": STATE_SKIPPED,
+        "XPASS": STATE_FAILED,
+    }
+    pattern = re.compile(
+        r"^(?P<node>[\w/.-]+::\S+)\s+"
+        r"(?P<status>PASSED|SKIPPED|FAILED|ERROR|XFAIL|XPASS)"
+        r"(?:\s+\[(?P<time>[\d.]+)s\])?"
+    )
+    for line in (output or "").splitlines():
+        match = pattern.match(line.strip())
+        if not match:
+            continue
+        node = match.group("node")
+        elapsed = float(match.group("time") or 0)
+        state = state_map[match.group("status")]
+        results.append({
+            'name': node,
+            'success': state in (STATE_PASSED, STATE_SKIPPED),
+            'time': elapsed,
+            'timed_out': False,
+            'state': state,
+        })
+    return results
+
+
 def _write_result_status(log_file, state, elapsed):
     status_map = {
         STATE_PASSED: "✓ PASSED",
@@ -334,7 +380,9 @@ def _run_file_batch(file_name, node_ids, args, log_file):
     targets = node_ids if args.regex else [file_name]
     with tempfile.TemporaryDirectory(prefix="run_tests_junit_") as tmpdir:
         junit_path = Path(tmpdir) / "pytest.xml"
-        cmd = ['pytest'] + targets + ['--junitxml', str(junit_path)]
+        cmd = ['pytest', '-vv', '--timeout', str(args.per_test_timeout)] + targets + [
+            '--junitxml', str(junit_path)
+        ]
         header = (
             f"\n{'='*70}\n"
             f"Running file batch: {file_name} ({len(node_ids)} collected test(s))\n"
@@ -368,7 +416,24 @@ def _run_file_batch(file_name, node_ids, args, log_file):
             except (AttributeError, TypeError):
                 pass
             log_file.flush()
-            return [], True, elapsed
+            output = ""
+            try:
+                if e.stdout:
+                    output += e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout
+                if e.stderr:
+                    output += "\n"
+                    output += e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr
+            except (AttributeError, TypeError):
+                pass
+            running_nodes = _running_nodes_from_output(output)
+            timed_out_node = running_nodes[-1] if running_nodes else None
+            partial_results, _, _, _ = _build_file_results(
+                node_ids, _parse_junit_testcases(junit_path),
+                file_name, log_file, elapsed, allow_partial=True
+            )
+            if not partial_results:
+                partial_results = _parse_verbose_node_results(output)
+            return partial_results, "timeout", elapsed, timed_out_node
 
         if result.stdout:
             log_file.write(result.stdout)
@@ -376,34 +441,45 @@ def _run_file_batch(file_name, node_ids, args, log_file):
             log_file.write(result.stderr)
         log_file.flush()
 
-        if result.returncode != 0:
-            msg = f"✗ FILE FAILED ({file_name}) with exit code {result.returncode} ({elapsed:.2f}s)\n"
-            print(msg, end='')
-            log_file.write(msg)
-            log_file.flush()
-            return [], True, elapsed
-
         testcase_states = _parse_junit_testcases(junit_path)
-        if len(testcase_states) != len(node_ids):
-            msg = (
-                f"✗ FILE RESULT MISMATCH ({file_name}): collected {len(node_ids)} node(s), "
-                f"but JUnit reported {len(testcase_states)} testcase(s). Falling back to per-test.\n"
-            )
+        if result.returncode != 0:
+            if testcase_states:
+                msg = f"✗ FILE FAILED ({file_name}) with exit code {result.returncode} ({elapsed:.2f}s)\n"
+                print(msg, end='')
+                log_file.write(msg)
+                log_file.flush()
+                return _build_file_results(node_ids, testcase_states, file_name, log_file, elapsed)
+            msg = f"✗ FILE FAILED ({file_name}) with exit code {result.returncode} ({elapsed:.2f}s); no JUnit results available.\n"
             print(msg, end='')
             log_file.write(msg)
             log_file.flush()
-            return [], True, elapsed
+            return [], "failed_no_results", elapsed, None
 
-        results = []
-        for node_id, (state, test_elapsed) in zip(node_ids, testcase_states):
-            results.append({
-                'name': node_id,
-                'success': state in (STATE_PASSED, STATE_SKIPPED),
-                'time': test_elapsed,
-                'timed_out': False,
-                'state': state,
-            })
-        return results, False, elapsed
+        return _build_file_results(node_ids, testcase_states, file_name, log_file, elapsed)
+
+
+def _build_file_results(node_ids, testcase_states, file_name, log_file, elapsed, allow_partial=False):
+    """Build result dictionaries from JUnit testcase states."""
+    if len(testcase_states) != len(node_ids) and not allow_partial:
+        msg = (
+            f"✗ FILE RESULT MISMATCH ({file_name}): collected {len(node_ids)} node(s), "
+            f"but JUnit reported {len(testcase_states)} testcase(s).\n"
+        )
+        print(msg, end='')
+        log_file.write(msg)
+        log_file.flush()
+        return [], "mismatch", elapsed, None
+
+    results = []
+    for node_id, (state, test_elapsed) in zip(node_ids, testcase_states):
+        results.append({
+            'name': node_id,
+            'success': state in (STATE_PASSED, STATE_SKIPPED),
+            'time': test_elapsed,
+            'timed_out': False,
+            'state': state,
+        })
+    return results, None, elapsed, None
 
 
 # Pytest node ID line (from --collect-only -q): path::Class::test_method or path::test_method[param]
@@ -925,32 +1001,14 @@ def _run_file_batch_mode(test_names, start_index, args, log_file, mode, count_ms
     start_time = time.time()
     groups = _group_node_ids_by_file(test_names[start_index:])
     node_index = start_index
-    fallback_timeout = DEFAULT_PER_TEST_TIMEOUT_SECONDS
-
     for file_name, node_ids in groups:
-        file_results, needs_fallback, _ = _run_file_batch(file_name, node_ids, args, log_file)
-        if needs_fallback:
-            fallback_msg = (
-                f"\nFalling back to per-test execution for {file_name} "
-                f"({len(node_ids)} collected test(s)).\n"
+        remaining_nodes = node_ids[:]
+        file_done = False
+        while remaining_nodes and not file_done:
+            file_results, reason, elapsed, timed_out_node = _run_file_batch(
+                file_name, remaining_nodes, args, log_file
             )
-            print(fallback_msg, end='')
-            log_file.write(fallback_msg)
-            log_file.flush()
-            for node_id in node_ids:
-                result = _run_one_test_with_progress(
-                    node_id, node_index + 1, len(test_names),
-                    args, log_file, by_id=True, timeout=fallback_timeout
-                )
-                results.append(result)
-                node_index += 1
-                if not result['success'] and args.stop_on_failure:
-                    stop_msg = f"\nStopping due to test failure: {node_id}\n"
-                    print(stop_msg, end='')
-                    log_file.write(stop_msg)
-                    log_file.flush()
-                    break
-        else:
+            recorded_names = set()
             for result in file_results:
                 node_index += 1
                 recorded = _record_file_batch_result(
@@ -958,6 +1016,62 @@ def _run_file_batch_mode(test_names, start_index, args, log_file, mode, count_ms
                     log_file, node_index, len(test_names)
                 )
                 results.append(recorded)
+                recorded_names.add(result['name'])
+
+            if reason is None:
+                file_done = True
+                continue
+            if reason == "timeout" and timed_out_node and timed_out_node in remaining_nodes:
+                timeout_position = remaining_nodes.index(timed_out_node)
+                for node_id in remaining_nodes[:timeout_position]:
+                    if node_id in recorded_names:
+                        continue
+                    node_index += 1
+                    recorded = _record_file_batch_result(
+                        node_id, STATE_ERROR, 0.0, log_file, node_index, len(test_names)
+                    )
+                    results.append(recorded)
+
+                if timed_out_node not in recorded_names:
+                    node_index += 1
+                    recorded = _record_file_batch_result(
+                        timed_out_node, STATE_TIMEDOUT, elapsed, log_file, node_index, len(test_names)
+                    )
+                    results.append(recorded)
+                else:
+                    for result in reversed(results):
+                        if result['name'] == timed_out_node:
+                            result['state'] = STATE_TIMEDOUT
+                            result['success'] = False
+                            result['timed_out'] = True
+                            break
+                msg = f"Skipping timed-out test and continuing: {timed_out_node}\n"
+                print(msg, end='')
+                log_file.write(msg)
+                log_file.flush()
+                remaining_nodes = remaining_nodes[timeout_position + 1:]
+                continue
+
+            msg = (
+                f"Unable to continue {file_name} after file batch issue ({reason}). "
+                "Recording remaining tests as error.\n"
+            )
+            print(msg, end='')
+            log_file.write(msg)
+            log_file.flush()
+            for node_id in remaining_nodes:
+                if node_id in recorded_names:
+                    continue
+                node_index += 1
+                recorded = _record_file_batch_result(
+                    node_id, STATE_ERROR, 0.0, log_file, node_index, len(test_names)
+                )
+                results.append(recorded)
+            file_done = True
+
+        if not remaining_nodes and not file_done:
+            file_done = True
+
         checkpoint_index = node_index - 1
         if not args.no_checkpoint and checkpoint_index >= 0:
             last_test = test_names[checkpoint_index]
@@ -1033,7 +1147,7 @@ def main():
         type=int,
         default=None,
         metavar='SECONDS',
-        help='Per-test timeout in seconds for --batch-mode test, CSV, and rerun modes (default: 300)'
+        help='Per-test pytest-timeout value in seconds (default: 300)'
     )
     parser.add_argument(
         '--batch-mode',
@@ -1132,10 +1246,6 @@ def main():
         sys.exit(1)
     if args.regex and not args.all_tests:
         print("Warning: --regex only applies to full-suite mode (--all-tests); ignoring --regex.\n")
-    if args.all_tests and args.batch_mode == BATCH_MODE_FILE and args.per_test_timeout is not None:
-        print("Error: --per-test-timeout can only be used with --batch-mode test.")
-        print("Use --per-file-timeout for --batch-mode file.")
-        sys.exit(1)
     if args.per_test_timeout is None:
         args.per_test_timeout = DEFAULT_PER_TEST_TIMEOUT_SECONDS
 

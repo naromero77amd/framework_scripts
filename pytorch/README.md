@@ -14,8 +14,8 @@ Full-suite mode defaults to `test/inductor/test_torchinductor.py` and runs one p
 - The script sets `PYTORCH_TEST_WITH_ROCM=1`, `HSA_FORCE_FINE_GRAIN_PCIE=1`, and `PYTORCH_TESTING_DEVICE_ONLY_FOR=cuda` when invoking tests.
 - **pytest, pytest-timeout, and expecttest**: The script checks these imports and aborts with a clear message if any are missing. Install with `pip install pytest pytest-timeout expecttest`.
 - Timeout behavior depends on execution strategy:
-  - CSV mode, rerun-failed mode, and full-suite `--batch-mode test` use per-test pytest-timeout.
-  - Full-suite `--batch-mode file` uses a per-file subprocess timeout first, then per-test fallback for failed or timed-out files.
+  - `--per-test-timeout` is passed to pytest-timeout and is a per-test timeout.
+  - Full-suite `--batch-mode file` also uses `--per-file-timeout` as an outer safety timeout for the file subprocess.
 
 ## Run Modes
 
@@ -93,6 +93,7 @@ pytest test/inductor/test_config.py --junitxml <tempfile>
 ```
 
 - Timeout is controlled by `--per-file-timeout` (default: 1800 seconds).
+- Per-test pytest-timeout is still enabled inside the file subprocess via `--per-test-timeout` (default: 300 seconds).
 - Passing files are parsed from pytest's JUnit XML output so per-test pass/skip/fail/error counts remain available.
 - This is the fastest mode because PyTorch and pytest startup costs are paid once per file instead of once per pytest node.
 
@@ -105,22 +106,20 @@ pytest --timeout 300 test/inductor/test_config.py::TestInductorConfig::test_set
 ```
 
 - Timeout is controlled by `--per-test-timeout` (default: 300 seconds).
-- `--per-test-timeout` is only valid with `--batch-mode test`, CSV mode, and rerun-failed mode.
 - The pytest-timeout plugin enforces the test timeout.
 - The script also applies an outer subprocess timeout of timeout + 60 seconds as a safety net for cases where pytest-timeout does not terminate a stuck process cleanly.
 
 ## File-Mode Fallback Behavior
 
-`--batch-mode file` is optimized for speed, but it still preserves exact per-test attribution when a file has problems.
+`--batch-mode file` is optimized for speed, but it still tries to keep the run moving when a test hangs.
 
 - If a file subprocess passes, JUnit XML is parsed and each testcase is recorded as passed, skipped, failed, or error.
-- If a file subprocess returns a non-zero exit code, the script reruns that file's discovered pytest node IDs one at a time with the per-test runner.
-- If a file subprocess exceeds `--per-file-timeout`, the script records a file timeout, then reruns that file's discovered pytest node IDs one at a time.
-- Fallback reruns use the existing per-test path and the default per-test timeout of 300 seconds.
-- Fallback starts from the beginning of the affected file's discovered node list. A file-level subprocess does not expose which internal test was last healthy before failure or timeout.
-- Checkpoints are written after file batches or fallback reruns so interrupted runs can continue from the next discovered test.
+- If a file subprocess returns a non-zero exit code but writes JUnit XML, the script records the individual failures/errors from XML. It does not rerun failures in test mode.
+- If a file subprocess exceeds `--per-file-timeout`, the script parses verbose pytest output to identify the currently running pytest node, records that node as timed out, skips it, and restarts file-mode execution for the remaining nodes in that file.
+- If the timed-out node cannot be identified, remaining nodes in that file are recorded as errors rather than repeatedly rerunning an unknown hang.
+- Checkpoints are written after file batches and timeout recovery so interrupted runs can continue from the next discovered test.
 
-This gives file mode most of the speed benefit of file-level execution while expanding failures and timeouts into exact per-test results.
+This gives file mode most of the speed benefit of file-level execution while recording individual failures and skipping timed-out tests so the rest of the file can continue.
 
 ## Rerun-Failed Mode
 
@@ -199,8 +198,8 @@ Each test is classified into exactly one state:
 | `--log-file PATH` | No | Path for the run log. |
 | `--stop-on-failure` | No | Stop after first failing test or fallback failure. |
 | `--batch-mode {file,test}` | No | Full-suite execution granularity. Default: `file`. |
-| `--per-file-timeout SECONDS` | No | Timeout for file subprocesses in `--batch-mode file`. Default: 1800. |
-| `--per-test-timeout SECONDS` | No | Timeout for per-test subprocesses in `--batch-mode test`, CSV, and rerun modes. Default: 300. |
+| `--per-file-timeout SECONDS` | No | Outer timeout for file subprocesses in `--batch-mode file`. Default: 1800. |
+| `--per-test-timeout SECONDS` | No | Pytest-timeout per-test timeout. Default: 300. |
 | `--resume` | No | Resume from the next test after the last checkpoint. |
 | `--no-checkpoint` | No | Disable checkpoint writing and resume handling. |
 | `--regex PATTERN` | No | Full-suite only. Filter discovered pytest node IDs by regex. |
