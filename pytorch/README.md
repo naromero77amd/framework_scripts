@@ -116,7 +116,7 @@ pytest --timeout 300 test/inductor/test_config.py::TestInductorConfig::test_set
 - If a file subprocess passes, JUnit XML is parsed and each testcase is recorded as passed, skipped, failed, or error.
 - If a file subprocess returns a non-zero exit code but writes JUnit XML, the script records the individual failures/errors from XML. It does not rerun failures in test mode.
 - If a file subprocess exceeds `--per-file-timeout`, the script parses verbose pytest output to identify the currently running pytest node, records that node as timed out, skips it, and restarts file-mode execution for the remaining nodes in that file.
-- If the timed-out node cannot be identified, remaining nodes in that file are recorded as errors rather than repeatedly rerunning an unknown hang.
+- If the timed-out node cannot be identified, remaining nodes in that file are recorded as missed rather than repeatedly rerunning an unknown hang.
 - Checkpoints are written after file batches and timeout recovery so interrupted runs can continue from the next discovered test.
 
 This gives file mode most of the speed benefit of file-level execution while recording individual failures and skipping timed-out tests so the rest of the file can continue.
@@ -170,6 +170,7 @@ Each test is classified into exactly one state:
 | ERROR | Non-zero exit and `RuntimeError` appears in stdout or stderr. |
 | FAILED | Non-zero exit and no `RuntimeError` appears in output. |
 | TIMEDOUT | The test or fallback test hit its timeout. |
+| MISSED | File mode hit an outer timeout and could not identify the currently running test, so remaining nodes in that file were not run. |
 
 ## Log File Format
 
@@ -179,8 +180,8 @@ Each test is classified into exactly one state:
   - a progress line: `[N/TOTAL]`
   - a `Running: <test_name>` header
   - test output, when available
-  - a status line: `PASSED`, `SKIPPED`, `ERROR`, `FAILED`, or `TIMEDOUT`
-- The final summary includes total run count, pass/skip/error/fail/timeout counts, total time, and per-state test lists.
+  - a status line: `PASSED`, `SKIPPED`, `ERROR`, `FAILED`, `TIMEDOUT`, or `MISSED`
+- The final summary includes total run count, pass/skip/error/fail/timeout/missed counts, total time, and per-state test lists.
 - `--rerun-failed` uses the `Failed tests:` and `Timed out tests:` summary sections.
 
 ## Arguments

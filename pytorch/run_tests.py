@@ -96,6 +96,7 @@ STATE_SKIPPED = "skipped"
 STATE_ERROR = "error"
 STATE_FAILED = "failed"
 STATE_TIMEDOUT = "timedout"
+STATE_MISSED = "missed"
 DISCOVERY_TIMEOUT_SECONDS = 1800
 DEFAULT_PER_TEST_TIMEOUT_SECONDS = 300
 DEFAULT_PER_FILE_TIMEOUT_SECONDS = 1800
@@ -199,13 +200,14 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
             log_file.write(result.stderr)
         log_file.flush()
 
-        # Print status to console (five states: PASSED, SKIPPED, ERROR, FAILED, TIMEDOUT)
+        # Print status to console.
         status_map = {
             STATE_PASSED: "✓ PASSED",
             STATE_SKIPPED: "✓ SKIPPED",
             STATE_ERROR: "✗ ERROR",
             STATE_FAILED: "✗ FAILED",
             STATE_TIMEDOUT: "✗ TIMEDOUT",
+            STATE_MISSED: "✗ MISSED",
         }
         status = status_map[state]
         status_msg = f"{status} ({elapsed_time:.2f}s)\n"
@@ -347,6 +349,7 @@ def _write_result_status(log_file, state, elapsed):
         STATE_ERROR: "✗ ERROR",
         STATE_FAILED: "✗ FAILED",
         STATE_TIMEDOUT: "✗ TIMEDOUT",
+        STATE_MISSED: "✗ MISSED",
     }
     status_msg = f"{status_map[state]} ({elapsed:.2f}s)\n"
     print(status_msg, end='')
@@ -891,6 +894,7 @@ def _write_run_summary(results, start_time, log_file, summary_title):
     error_count = sum(1 for r in results if r.get('state') == STATE_ERROR)
     failed_count = sum(1 for r in results if r.get('state') == STATE_FAILED)
     timedout_count = sum(1 for r in results if r.get('state') == STATE_TIMEDOUT)
+    missed_count = sum(1 for r in results if r.get('state') == STATE_MISSED)
     summary = f"\n{'='*70}\n{summary_title}\n{'='*70}\n"
     summary += f"Total tests run: {len(results)}\n"
     summary += f"Passed: {passed}\n"
@@ -898,6 +902,7 @@ def _write_run_summary(results, start_time, log_file, summary_title):
     summary += f"Error: {error_count}\n"
     summary += f"Failed: {failed_count}\n"
     summary += f"Timed out: {timedout_count}\n"
+    summary += f"Missed: {missed_count}\n"
     summary += f"Total time: {total_time:.2f}s\n"
     for state, label in [
         (STATE_PASSED, "Passed"),
@@ -905,6 +910,7 @@ def _write_run_summary(results, start_time, log_file, summary_title):
         (STATE_ERROR, "Error"),
         (STATE_FAILED, "Failed"),
         (STATE_TIMEDOUT, "Timed out"),
+        (STATE_MISSED, "Missed"),
     ]:
         subset = [r for r in results if r.get('state') == state]
         if subset:
@@ -915,7 +921,7 @@ def _write_run_summary(results, start_time, log_file, summary_title):
     print(summary, end='')
     log_file.write(summary)
     log_file.flush()
-    any_bad = error_count > 0 or failed_count > 0 or timedout_count > 0
+    any_bad = error_count > 0 or failed_count > 0 or timedout_count > 0 or missed_count > 0
     return 0 if not any_bad else 1
 
 
@@ -1054,7 +1060,7 @@ def _run_file_batch_mode(test_names, start_index, args, log_file, mode, count_ms
 
             msg = (
                 f"Unable to continue {file_name} after file batch issue ({reason}). "
-                "Recording remaining tests as error.\n"
+                "Recording remaining tests as missed.\n"
             )
             print(msg, end='')
             log_file.write(msg)
@@ -1064,7 +1070,7 @@ def _run_file_batch_mode(test_names, start_index, args, log_file, mode, count_ms
                     continue
                 node_index += 1
                 recorded = _record_file_batch_result(
-                    node_id, STATE_ERROR, 0.0, log_file, node_index, len(test_names)
+                    node_id, STATE_MISSED, 0.0, log_file, node_index, len(test_names)
                 )
                 results.append(recorded)
             file_done = True

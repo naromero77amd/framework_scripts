@@ -13,7 +13,7 @@ import subprocess
 from pathlib import Path
 
 
-STATUS_RE = re.compile(r"^(?:✓|✗)\s+(PASSED|SKIPPED|ERROR|FAILED|TIMEDOUT)\s+\(([\d.]+)s\)")
+STATUS_RE = re.compile(r"^(?:✓|✗)\s+(PASSED|SKIPPED|ERROR|FAILED|TIMEDOUT|MISSED)\s+\(([\d.]+)s\)")
 PROGRESS_RE = re.compile(r"^\[(\d+)/(\d+)\]\s*$")
 RUNNING_RE = re.compile(r"^Running:\s+(.+)$")
 SUMMARY_RE = re.compile(r"^([A-Za-z ]+):\s+(\d+)\s*$")
@@ -137,13 +137,13 @@ def load_checkpoint(path: Path) -> dict[str, object] | None:
 
 
 def format_count_table(rows: list[tuple[str, collections.Counter]]) -> str:
-    header = "| Test Suite | Total | Passed | Skipped | Failed | Error | Timed Out | In Progress |\n"
-    sep = "|---|---:|---:|---:|---:|---:|---:|---:|\n"
+    header = "| Test Suite | Total | Passed | Skipped | Failed | Error | Timed Out | Missed | In Progress |\n"
+    sep = "|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
     body = []
     for suite, counter in rows:
         total = sum(counter.values())
         body.append(
-            "| {suite} | {total} | {passed} | {skipped} | {failed} | {error} | {timedout} | {in_progress} |".format(
+            "| {suite} | {total} | {passed} | {skipped} | {failed} | {error} | {timedout} | {missed} | {in_progress} |".format(
                 suite=suite,
                 total=total,
                 passed=counter["passed"],
@@ -151,6 +151,7 @@ def format_count_table(rows: list[tuple[str, collections.Counter]]) -> str:
                 failed=counter["failed"],
                 error=counter["error"],
                 timedout=counter["timedout"],
+                missed=counter["missed"],
                 in_progress=counter["in_progress"],
             )
         )
@@ -186,7 +187,7 @@ def main() -> None:
         suite = test_suite(name)
         state = str(result.get("state"))
         suite_counts[suite][state] += 1
-        if state in {"failed", "error", "timedout"}:
+        if state in {"failed", "error", "timedout", "missed"}:
             suite_failures[suite].append(result)
 
     completed = 0
@@ -237,6 +238,7 @@ def main() -> None:
     lines.append(f"- Failed: `{state_counts['failed']}`")
     lines.append(f"- Error: `{state_counts['error']}`")
     lines.append(f"- Timed out: `{state_counts['timedout']}`")
+    lines.append(f"- Missed: `{state_counts['missed']}`")
     if checkpoint:
         lines.append(f"- Last completed test: `{checkpoint.get('last_test')}`")
         lines.append(f"- Next test: `{checkpoint.get('next_test')}`")
@@ -249,9 +251,9 @@ def main() -> None:
     sorted_rows = sorted(suite_counts.items(), key=lambda item: item[0])
     lines.append(format_count_table(sorted_rows))
 
-    lines.append("## Failures And Timeouts By Suite\n")
+    lines.append("## Failures, Timeouts, And Missed Tests By Suite\n")
     if not suite_failures:
-        lines.append("No failures, errors, or timeouts have been observed so far.\n")
+        lines.append("No failures, errors, timeouts, or missed tests have been observed so far.\n")
     else:
         for suite in sorted(suite_failures):
             failures = suite_failures[suite]
@@ -261,7 +263,8 @@ def main() -> None:
             lines.append(f"### `{suite}`\n")
             counter = suite_counts[suite]
             lines.append(
-                f"- Failed: `{counter['failed']}`, Error: `{counter['error']}`, Timed out: `{counter['timedout']}`"
+                f"- Failed: `{counter['failed']}`, Error: `{counter['error']}`, "
+                f"Timed out: `{counter['timedout']}`, Missed: `{counter['missed']}`"
             )
             lines.append("- Common signatures:")
             for signature, count in signature_counts.most_common(5):
