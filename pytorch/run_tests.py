@@ -374,13 +374,13 @@ def _record_file_batch_result(node_id, state, elapsed, log_file, index, total):
     }
 
 
-def _run_file_batch(file_name, node_ids, args, log_file, force_node_targets=False):
+def _run_file_batch(file_name, node_ids, args, log_file):
     """
     Run one file (or a filtered set of nodes from one file) in one pytest process.
     Returns (results, needs_fallback, elapsed).
     """
     env = _build_test_env()
-    targets = node_ids if args.regex or force_node_targets else [file_name]
+    targets = node_ids
     with tempfile.TemporaryDirectory(prefix="run_tests_junit_") as tmpdir:
         junit_path = Path(tmpdir) / "pytest.xml"
         cmd = ['pytest', '-vv', '--timeout', str(args.per_test_timeout)] + targets + [
@@ -1011,10 +1011,8 @@ def _run_file_batch_mode(test_names, start_index, args, log_file, mode, count_ms
         remaining_nodes = node_ids[:]
         file_done = False
         while remaining_nodes and not file_done:
-            force_node_targets = len(remaining_nodes) != len(node_ids)
             file_results, reason, elapsed, timed_out_node = _run_file_batch(
-                file_name, remaining_nodes, args, log_file,
-                force_node_targets=force_node_targets
+                file_name, remaining_nodes, args, log_file
             )
             recorded_names = set()
             for result in file_results:
