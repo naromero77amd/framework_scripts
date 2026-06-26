@@ -1034,7 +1034,7 @@ def _run_file_batch_mode(test_names, start_index, args, log_file, mode, count_ms
                         continue
                     node_index += 1
                     recorded = _record_file_batch_result(
-                        node_id, STATE_ERROR, 0.0, log_file, node_index, len(test_names)
+                        node_id, STATE_MISSED, 0.0, log_file, node_index, len(test_names)
                     )
                     results.append(recorded)
 
