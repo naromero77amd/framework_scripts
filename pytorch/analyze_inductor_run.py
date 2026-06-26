@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime as dt
+import io
 import json
 import platform
 import re
 import subprocess
+import importlib.util
 from pathlib import Path
 
 
@@ -124,7 +126,19 @@ def parse_log(log_path: Path) -> tuple[list[dict[str, object]], dict[str, int]]:
         current["details"] = current_lines
         results.append(current)
 
-    return results, final_summary
+    latest_by_name: collections.OrderedDict[str, dict[str, object]] = collections.OrderedDict()
+    unnamed_results: list[dict[str, object]] = []
+    for result in results:
+        name = result.get("name")
+        if not name:
+            unnamed_results.append(result)
+            continue
+        name_str = str(name)
+        if name_str in latest_by_name:
+            del latest_by_name[name_str]
+        latest_by_name[name_str] = result
+
+    return unnamed_results + list(latest_by_name.values()), final_summary
 
 
 def load_checkpoint(path: Path) -> dict[str, object] | None:
@@ -158,6 +172,49 @@ def format_count_table(rows: list[tuple[str, collections.Counter]]) -> str:
     return header + sep + "\n".join(body) + "\n"
 
 
+def discover_expected_nodes(meta: dict[str, str], pytorch_root: Path) -> list[str]:
+    """Best-effort rediscovery of expected nodes for completed framework runs."""
+    if meta.get("FILES") != "inductor_all":
+        return []
+
+    run_tests_path = Path(__file__).with_name("run_tests.py")
+    try:
+        spec = importlib.util.spec_from_file_location("framework_run_tests", run_tests_path)
+        if spec is None or spec.loader is None:
+            return []
+        run_tests = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(run_tests)
+        test_file_rel_paths = [
+            str(Path("test") / f)
+            for f in run_tests.discover_inductor_core_files(str(pytorch_root))
+        ]
+        return run_tests.discover_tests(
+            str(pytorch_root),
+            log_file=io.StringIO(),
+            test_file_rel_paths=test_file_rel_paths,
+        )
+    except Exception:
+        return []
+
+
+def add_missing_completed_results(results: list[dict[str, object]], expected_nodes: list[str]) -> list[dict[str, object]]:
+    """Mark discovered nodes with no log result as missed."""
+    if not expected_nodes:
+        return results
+    seen = {str(result.get("name")) for result in results if result.get("name")}
+    updated = list(results)
+    for node_id in expected_nodes:
+        if node_id in seen:
+            continue
+        updated.append({
+            "name": node_id,
+            "state": "missed",
+            "time": 0.0,
+            "details": ["Discovered test was not recorded in the log; inferred as missed."],
+        })
+    return updated
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -178,18 +235,6 @@ def main() -> None:
     results, final_summary = parse_log(log_path)
     checkpoint = load_checkpoint(checkpoint_path)
 
-    state_counts = collections.Counter(str(r.get("state")) for r in results)
-    suite_counts: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
-    suite_failures: dict[str, list[dict[str, object]]] = collections.defaultdict(list)
-
-    for result in results:
-        name = str(result.get("name") or "(unknown)")
-        suite = test_suite(name)
-        state = str(result.get("state"))
-        suite_counts[suite][state] += 1
-        if state in {"failed", "error", "timedout", "missed"}:
-            suite_failures[suite].append(result)
-
     completed = 0
     total = 0
     if checkpoint:
@@ -201,6 +246,22 @@ def main() -> None:
         totals = [int(r.get("total") or 0) for r in results if r.get("total")]
         total = totals[-1] if totals else 0
         completed = max((int(r.get("index") or 0) for r in results), default=0)
+
+    if total and completed >= total and len({str(r.get("name")) for r in results if r.get("name")}) < total:
+        expected_nodes = discover_expected_nodes(meta, pytorch_root)
+        results = add_missing_completed_results(results, expected_nodes)
+
+    state_counts = collections.Counter(str(r.get("state")) for r in results)
+    suite_counts: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    suite_failures: dict[str, list[dict[str, object]]] = collections.defaultdict(list)
+
+    for result in results:
+        name = str(result.get("name") or "(unknown)")
+        suite = test_suite(name)
+        state = str(result.get("state"))
+        suite_counts[suite][state] += 1
+        if state in {"failed", "error", "timedout", "missed"}:
+            suite_failures[suite].append(result)
 
     branch = run_text(["git", "branch", "--show-current"], cwd=pytorch_root)
     commit = run_text(["git", "rev-parse", "--short", "HEAD"], cwd=pytorch_root)
