@@ -91,7 +91,7 @@ File mode is the default. It runs one pytest subprocess per test file:
 pytest test/inductor/test_config.py --junitxml <tempfile>
 ```
 
-- Timeout is controlled by `--per-file-timeout` (default: 1800 seconds).
+- Timeout is controlled by `--per-file-timeout` (default: 600 seconds).
 - Per-test pytest-timeout is still enabled inside the file subprocess via `--per-test-timeout` (default: 300 seconds).
 - Passing files are parsed from pytest's JUnit XML output so per-test pass/skip/fail/error counts remain available.
 - This is the fastest mode because PyTorch and pytest startup costs are paid once per file instead of once per pytest node.
@@ -199,7 +199,7 @@ Each test is classified into exactly one state:
 | `--log-file PATH` | No | Path for the run log. |
 | `--stop-on-failure` | No | Stop after first failing test or fallback failure. |
 | `--batch-mode {file,test}` | No | Full-suite execution granularity. Default: `file`. |
-| `--per-file-timeout SECONDS` | No | Outer timeout for file subprocesses in `--batch-mode file`. Default: 1800. |
+| `--per-file-timeout SECONDS` | No | Outer timeout for file subprocesses in `--batch-mode file`. Default: 600. |
 | `--per-test-timeout SECONDS` | No | Pytest-timeout per-test timeout. Default: 300. |
 | `--resume` | No | Resume from the next test after the last checkpoint. |
 | `--no-checkpoint` | No | Disable checkpoint writing and resume handling. |
