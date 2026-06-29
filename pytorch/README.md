@@ -116,7 +116,8 @@ pytest --timeout 300 test/inductor/test_config.py::TestInductorConfig::test_set
 - If a file subprocess returns a non-zero exit code but writes JUnit XML, the script records the individual failures/errors from XML. It does not rerun failures in test mode.
 - If a file subprocess exceeds `--per-file-timeout`, the script parses verbose pytest output to identify the currently running pytest node, records that node as timed out, skips it, and restarts file-mode execution for the remaining nodes in that file.
 - If tests before the timed-out node cannot be recovered from JUnit XML or verbose pytest output, they are recorded as missed rather than error.
-- If the timed-out node cannot be identified, remaining nodes in that file are recorded as missed rather than repeatedly rerunning an unknown hang.
+- If the timed-out node cannot be identified, the next unresolved test in that file is recorded as missed and the script continues with the following node.
+- If four unidentified timeouts happen in a row in the same file, the remaining nodes in that file are recorded as missed to avoid repeatedly rerunning an unknown hang.
 - Checkpoints are written after file batches and timeout recovery so interrupted runs can continue from the next discovered test.
 
 This gives file mode most of the speed benefit of file-level execution while recording individual failures and skipping timed-out tests so the rest of the file can continue.

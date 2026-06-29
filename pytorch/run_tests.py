@@ -102,6 +102,7 @@ DEFAULT_PER_TEST_TIMEOUT_SECONDS = 300
 DEFAULT_PER_FILE_TIMEOUT_SECONDS = 1800
 BATCH_MODE_FILE = "file"
 BATCH_MODE_TEST = "test"
+UNKNOWN_TIMEOUT_MISS_LIMIT = 4
 
 
 def _output_indicates_skipped(stdout: str, stderr: str) -> bool:
@@ -1009,6 +1010,7 @@ def _run_file_batch_mode(test_names, start_index, args, log_file, mode, count_ms
     node_index = start_index
     for file_name, node_ids in groups:
         remaining_nodes = node_ids[:]
+        unknown_timeout_misses = 0
         file_done = False
         while remaining_nodes and not file_done:
             file_results, reason, elapsed, timed_out_node = _run_file_batch(
@@ -1056,6 +1058,42 @@ def _run_file_batch_mode(test_names, start_index, args, log_file, mode, count_ms
                 log_file.write(msg)
                 log_file.flush()
                 remaining_nodes = remaining_nodes[timeout_position + 1:]
+                unknown_timeout_misses = 0
+                continue
+
+            if reason == "timeout" and remaining_nodes:
+                missed_node = remaining_nodes[0]
+                unknown_timeout_misses += 1
+                node_index += 1
+                recorded = _record_file_batch_result(
+                    missed_node, STATE_MISSED, elapsed, log_file, node_index, len(test_names)
+                )
+                results.append(recorded)
+                msg = (
+                    f"Could not identify timed-out test in {file_name}; "
+                    f"marking next unresolved test as missed ({unknown_timeout_misses}/"
+                    f"{UNKNOWN_TIMEOUT_MISS_LIMIT}): {missed_node}\n"
+                )
+                print(msg, end='')
+                log_file.write(msg)
+                log_file.flush()
+                remaining_nodes = remaining_nodes[1:]
+                if unknown_timeout_misses >= UNKNOWN_TIMEOUT_MISS_LIMIT and remaining_nodes:
+                    msg = (
+                        f"Reached {UNKNOWN_TIMEOUT_MISS_LIMIT} consecutive unidentified timeouts "
+                        f"in {file_name}; recording remaining tests as missed.\n"
+                    )
+                    print(msg, end='')
+                    log_file.write(msg)
+                    log_file.flush()
+                    for node_id in remaining_nodes:
+                        node_index += 1
+                        recorded = _record_file_batch_result(
+                            node_id, STATE_MISSED, 0.0, log_file, node_index, len(test_names)
+                        )
+                        results.append(recorded)
+                    remaining_nodes = []
+                    file_done = True
                 continue
 
             msg = (

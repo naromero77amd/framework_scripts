@@ -19,6 +19,13 @@ STATUS_RE = re.compile(r"^(?:✓|✗)\s+(PASSED|SKIPPED|ERROR|FAILED|TIMEDOUT|MI
 PROGRESS_RE = re.compile(r"^\[(\d+)/(\d+)\]\s*$")
 RUNNING_RE = re.compile(r"^Running:\s+(.+)$")
 SUMMARY_RE = re.compile(r"^([A-Za-z ]+):\s+(\d+)\s*$")
+RERUN_FIVE_SUITE_FILES = [
+    "inductor/test_aot_inductor.py",
+    "inductor/test_control_flow.py",
+    "inductor/test_cudagraph_trees.py",
+    "inductor/test_cudagraph_trees_expandable_segments.py",
+    "inductor/test_torchinductor_opinfo.py",
+]
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -174,9 +181,6 @@ def format_count_table(rows: list[tuple[str, collections.Counter]]) -> str:
 
 def discover_expected_nodes(meta: dict[str, str], pytorch_root: Path) -> list[str]:
     """Best-effort rediscovery of expected nodes for completed framework runs."""
-    if meta.get("FILES") != "inductor_all":
-        return []
-
     run_tests_path = Path(__file__).with_name("run_tests.py")
     try:
         spec = importlib.util.spec_from_file_location("framework_run_tests", run_tests_path)
@@ -184,10 +188,15 @@ def discover_expected_nodes(meta: dict[str, str], pytorch_root: Path) -> list[st
             return []
         run_tests = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(run_tests)
-        test_file_rel_paths = [
-            str(Path("test") / f)
-            for f in run_tests.discover_inductor_core_files(str(pytorch_root))
-        ]
+        if meta.get("FILES") == "inductor_all":
+            test_file_rel_paths = [
+                str(Path("test") / f)
+                for f in run_tests.discover_inductor_core_files(str(pytorch_root))
+            ]
+        elif meta.get("FILES") == "rerun_five_suites":
+            test_file_rel_paths = [str(Path("test") / f) for f in RERUN_FIVE_SUITE_FILES]
+        else:
+            return []
         return run_tests.discover_tests(
             str(pytorch_root),
             log_file=io.StringIO(),
