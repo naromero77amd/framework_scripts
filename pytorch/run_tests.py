@@ -275,7 +275,9 @@ def _parse_junit_testcases(junit_path):
     """
     Return per-testcase states from pytest's JUnit XML in execution order.
 
-    Each item is (state, elapsed). State is one of passed, skipped, failed, error.
+    Each item is (node_hint, state, elapsed). State is one of passed, skipped,
+    failed, error. node_hint is a best-effort pytest node id fragment from
+    JUnit classname/name.
     """
     try:
         root = ET.parse(junit_path).getroot()
@@ -285,6 +287,9 @@ def _parse_junit_testcases(junit_path):
     cases = []
     for testcase in root.iter("testcase"):
         elapsed = float(testcase.attrib.get("time", "0") or 0)
+        classname = testcase.attrib.get("classname", "")
+        name = testcase.attrib.get("name", "")
+        node_hint = _junit_node_hint(classname, name)
         if testcase.find("skipped") is not None:
             state = STATE_SKIPPED
         elif testcase.find("error") is not None:
@@ -293,8 +298,43 @@ def _parse_junit_testcases(junit_path):
             state = STATE_FAILED
         else:
             state = STATE_PASSED
-        cases.append((state, elapsed))
+        cases.append((node_hint, state, elapsed))
     return cases
+
+
+def _junit_node_hint(classname: str, name: str) -> str:
+    """Convert pytest JUnit classname/name into a pytest-node-like hint."""
+    if not classname:
+        return name
+    parts = classname.split(".")
+    class_name = parts[-1]
+    module_parts = parts[:-1]
+    if module_parts and module_parts[0] == "test":
+        file_part = "/".join(module_parts) + ".py"
+        return f"{file_part}::{class_name}::{name}"
+    return f"{classname}::{name}"
+
+
+def _match_junit_cases_to_nodes(node_ids, testcase_states):
+    """Match JUnit testcase records to discovered node ids by identity."""
+    unmatched = list(testcase_states)
+    matched = []
+    for node_id in node_ids:
+        found_index = None
+        for i, (node_hint, state, elapsed) in enumerate(unmatched):
+            if node_hint == node_id or node_id.endswith(node_hint) or node_hint.endswith(node_id):
+                found_index = i
+                break
+            # JUnit names often omit the leading test/ path in classname.
+            if node_id.split("/", 1)[-1].endswith(node_hint):
+                found_index = i
+                break
+        if found_index is None:
+            matched.append((node_id, None, None))
+            continue
+        _, state, elapsed = unmatched.pop(found_index)
+        matched.append((node_id, state, elapsed))
+    return matched, unmatched
 
 
 def _running_nodes_from_output(output: str):
@@ -464,18 +504,22 @@ def _run_file_batch(file_name, node_ids, args, log_file):
 
 def _build_file_results(node_ids, testcase_states, file_name, log_file, elapsed, allow_partial=False):
     """Build result dictionaries from JUnit testcase states."""
-    if len(testcase_states) != len(node_ids) and not allow_partial:
-        msg = (
-            f"✗ FILE RESULT MISMATCH ({file_name}): collected {len(node_ids)} node(s), "
-            f"but JUnit reported {len(testcase_states)} testcase(s).\n"
-        )
+    matched, extra_cases = _match_junit_cases_to_nodes(node_ids, testcase_states)
+    missing_count = sum(1 for _, state, _ in matched if state is None)
+    if (missing_count or extra_cases) and not allow_partial:
+        msg = f"JUnit result mismatch ({file_name}): "
+        msg += f"{missing_count} discovered node(s) missing, {len(extra_cases)} extra testcase(s).\n"
         print(msg, end='')
         log_file.write(msg)
         log_file.flush()
-        return [], "mismatch", elapsed, None
 
     results = []
-    for node_id, (state, test_elapsed) in zip(node_ids, testcase_states):
+    for node_id, state, test_elapsed in matched:
+        if state is None:
+            if allow_partial:
+                continue
+            state = STATE_MISSED
+            test_elapsed = 0.0
         results.append({
             'name': node_id,
             'success': state in (STATE_PASSED, STATE_SKIPPED),
