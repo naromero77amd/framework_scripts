@@ -6,7 +6,7 @@
 - Full-suite mode: discover tests from one or more PyTorch test files.
 - Rerun-failed mode: rerun failures, and optionally timeouts, from a previous log.
 
-Full-suite mode defaults to `test/inductor/test_torchinductor.py` and runs one pytest process per test file for lower overhead. Use `--batch-mode test` to use the historical one-pytest-process-per-test-node behavior.
+Full-suite mode defaults to `test/inductor/test_torchinductor.py` and runs one pytest process per test file for lower overhead. Use `--batch-mode shard` to run fixed-size chunks, or `--batch-mode test` to use the historical one-pytest-process-per-test-node behavior.
 
 ## Requirements
 
@@ -15,7 +15,7 @@ Full-suite mode defaults to `test/inductor/test_torchinductor.py` and runs one p
 - **pytest, pytest-timeout, and expecttest**: The script checks these imports and aborts with a clear message if any are missing. Install with `pip install pytest pytest-timeout expecttest`.
 - Timeout behavior depends on execution strategy:
   - `--per-test-timeout` is passed to pytest-timeout and is a per-test timeout.
-  - Full-suite `--batch-mode file` also uses `--per-file-timeout` as an outer safety timeout for the file subprocess.
+  - Full-suite `--batch-mode file` and `--batch-mode shard` also use `--per-file-timeout` as an outer safety timeout for each pytest subprocess.
 
 ## Run Modes
 
@@ -26,6 +26,12 @@ Use exactly one of these modes:
 | CSV | `csv_file` positional argument | Run tests listed in a CSV file with a `test_name` column. |
 | Full suite | `--all-tests` | Discover tests from one or more files under `PYTORCH_PATH/test/`, then run them with the selected batch mode. |
 | Rerun failed | `--rerun-failed LOG_FILE` | Parse a previous log and rerun failed tests. Add `--rerun-include-timeouts` to include timed-out tests. |
+
+Run modes and batch modes are separate concepts:
+
+- **Run mode** chooses where the test list comes from: CSV, full-suite discovery, or a previous log.
+- **Batch mode** only applies to full-suite mode. It controls how discovered pytest node IDs are grouped for execution.
+- **Rerun-failed mode** is log-based. It does not use `--batch-mode file`, `--batch-mode shard`, or JUnit XML from the original run.
 
 Examples:
 
@@ -83,6 +89,8 @@ Full-suite mode starts from a list of files under `PYTORCH_PATH/test/`.
 
 ## Full-Suite Execution Strategy
 
+Batch modes apply only to full-suite mode (`--all-tests`). CSV mode and rerun-failed mode use per-test subprocess execution.
+
 ### File mode: `--batch-mode file`
 
 File mode is the default. It runs one pytest subprocess per test file:
@@ -95,6 +103,21 @@ pytest test/inductor/test_config.py --junitxml <tempfile>
 - Per-test pytest-timeout is still enabled inside the file subprocess via `--per-test-timeout` (default: 1200 seconds / 20 minutes).
 - Passing files are parsed from pytest's JUnit XML output so per-test pass/skip/fail/error counts remain available.
 - This is the fastest mode because PyTorch and pytest startup costs are paid once per file instead of once per pytest node.
+- `test/inductor/test_torchinductor_opinfo.py` is automatically run in shard batches in file mode because one full-file pytest subprocess can be too large or crash before complete JUnit output is written.
+
+### Shard mode: `--batch-mode shard`
+
+Shard mode runs discovered pytest node IDs in fixed-size chunks within each file:
+
+```bash
+pytest test/inductor/test_config.py::TestA::test_1 test/inductor/test_config.py::TestA::test_2 ... --junitxml <tempfile>
+```
+
+- Shard size is controlled by `--shard-size` (default: 100 tests).
+- Timeout is controlled by `--per-file-timeout` for each shard subprocess.
+- Per-test pytest-timeout is still enabled inside each shard via `--per-test-timeout`.
+- JUnit XML parsing, timeout recovery, `MISSED` handling, and checkpoints use the same behavior as file mode.
+- Use this mode when whole-file execution records many missed tests because a large file crashes or times out before complete results are available.
 
 ### Test mode: `--batch-mode test`
 
@@ -108,9 +131,9 @@ pytest --timeout 300 test/inductor/test_config.py::TestInductorConfig::test_set
 - The pytest-timeout plugin enforces the test timeout.
 - The script also applies an outer subprocess timeout of timeout + 60 seconds as a safety net for cases where pytest-timeout does not terminate a stuck process cleanly.
 
-## File-Mode Fallback Behavior
+## File And Shard Fallback Behavior
 
-`--batch-mode file` is optimized for speed, but it still tries to keep the run moving when a test hangs.
+`--batch-mode file` and `--batch-mode shard` are optimized for lower subprocess overhead, but they still try to keep the run moving when a test hangs.
 
 - If a file subprocess passes, JUnit XML is parsed and each testcase is recorded as passed, skipped, failed, or error.
 - If a file subprocess returns a non-zero exit code but writes JUnit XML, the script records the individual failures/errors from XML. It does not rerun failures in test mode.
@@ -120,17 +143,24 @@ pytest --timeout 300 test/inductor/test_config.py::TestInductorConfig::test_set
 - If four unidentified timeouts happen in a row in the same file, the remaining nodes in that file are recorded as missed to avoid repeatedly rerunning an unknown hang.
 - Checkpoints are written after file batches and timeout recovery so interrupted runs can continue from the next discovered test.
 
-This gives file mode most of the speed benefit of file-level execution while recording individual failures and skipping timed-out tests so the rest of the file can continue.
+This gives file and shard mode most of the speed benefit of batched execution while recording individual failures and skipping timed-out tests so the rest of the file can continue.
 
 ## Rerun-Failed Mode
 
 - Input is a log file produced by a previous CSV or full-suite run.
-- By default, only failed tests are rerun.
-- Add `--rerun-include-timeouts` to also rerun timed-out tests.
+- Rerun-failed mode is its own run mode, not a full-suite batch mode.
+- By default, only tests listed in the log's `Failed tests:` summary section are rerun.
+- Add `--rerun-include-timeouts` to also rerun tests listed in the `Timed out tests:` summary section.
 - The script looks for:
   - `Mode: full_suite` or `Mode: csv`
   - `Failed tests:` summary section
   - `Timed out tests:` summary section
+- It does not read JUnit XML. It uses only the text log passed to `--rerun-failed`.
+- It always reruns selected tests one at a time:
+  - Previous `Mode: full_suite` logs rerun entries as full pytest node IDs.
+  - Previous `Mode: csv` logs rerun entries as `-k` keyword expressions against the default inductor test file.
+- `--batch-mode`, `--per-file-timeout`, and `--shard-size` do not apply to rerun-failed mode.
+- The current parser does not select `ERROR` or `MISSED` summary sections for rerun.
 - Rerun mode creates a new log file named like `{input_stem}.rerun_{timestamp}.log`.
 - If there are no tests to rerun, the script exits successfully.
 
@@ -177,6 +207,7 @@ Each test is classified into exactly one state:
 
 - Every run logs the PyTorch path and log file path.
 - CSV and full-suite runs write `Mode: csv` or `Mode: full_suite`.
+- Rerun-failed logs preserve the original mode (`Mode: csv` or `Mode: full_suite`) so later reruns know whether entries are CSV keywords or full pytest node IDs.
 - Each recorded test has:
   - a progress line: `[N/TOTAL]`
   - a `Running: <test_name>` header
@@ -184,28 +215,41 @@ Each test is classified into exactly one state:
   - a status line: `PASSED`, `SKIPPED`, `ERROR`, `FAILED`, `TIMEDOUT`, or `MISSED`
 - The final summary includes total run count, pass/skip/error/fail/timeout/missed counts, total time, and per-state test lists.
 - `--rerun-failed` uses the `Failed tests:` and `Timed out tests:` summary sections.
+- File and shard batch modes create temporary JUnit XML files internally for per-test result attribution, but those XML files are not the public report format and are not used by rerun-failed mode.
+
+## Analysis Script
+
+`analyze_inductor_run.py` analyzes the runner's text log, not JUnit XML.
+
+- It reads the log path and checkpoint path from the metadata file passed with `--meta`.
+- It parses progress lines, `Running:` headers, and status lines from the log.
+- It uses the checkpoint to report progress for active or resumable runs.
+- It works across full-suite `file`, `shard`, and `test` batch modes because all of them write the same per-test log records.
+- It can also parse CSV and rerun-failed logs if the metadata file points at those logs.
+- For completed framework runs with known metadata file sets, it may rediscover expected pytest nodes and mark unrecorded tests as `MISSED`; this rediscovery is separate from JUnit XML.
 
 ## Arguments
 
-| Argument | Required | Description |
-|----------|----------|-------------|
-| `csv_file` | One of CSV / full-suite / rerun-failed | Path to CSV with a `test_name` column. Omit when using `--all-tests` or `--rerun-failed`. |
-| `--all-tests` | One of CSV / full-suite / rerun-failed | Discover and run tests in the configured full-suite file list. |
-| `--include-inductor-all-tests` | No | Add PyTorch CI `inductor_core` test files from `--pytorch-path`; implies `--all-tests`. |
-| `--include-triton-nightly-inductor-tests` | No | Add ROCm torch-triton-nightly Inductor validation files; implies `--all-tests`. |
-| `--rerun-failed LOG_FILE` | One of CSV / full-suite / rerun-failed | Rerun failed tests from a previous log. |
-| `--rerun-include-timeouts` | No | With `--rerun-failed`, also rerun timed-out tests. |
-| `--pytorch-path PATH` | Yes | Path to the PyTorch checkout. |
-| `--log-file PATH` | No | Path for the run log. |
-| `--stop-on-failure` | No | Stop after first failing test or fallback failure. |
-| `--batch-mode {file,test}` | No | Full-suite execution granularity. Default: `file`. |
-| `--per-file-timeout SECONDS` | No | Outer timeout for file subprocesses in `--batch-mode file`. Default: 43200. |
-| `--per-test-timeout SECONDS` | No | Pytest-timeout per-test timeout. Default: 1200. |
-| `--resume` | No | Resume from the next test after the last checkpoint. |
-| `--no-checkpoint` | No | Disable checkpoint writing and resume handling. |
-| `--regex PATTERN` | No | Full-suite only. Filter discovered pytest node IDs by regex. |
-| `-i`, `--input-files FILE [FILE ...]` | No | Full-suite only. Add files under `PYTORCH_PATH/test/`. |
-| `--collect-only` | No | Count tests only; do not execute tests or write a log. |
+| Argument | Applies To | Description |
+|----------|------------|-------------|
+| `csv_file` | CSV mode | Path to CSV with a `test_name` column. Omit when using `--all-tests` or `--rerun-failed`. |
+| `--all-tests` | Full-suite mode | Discover and run tests in the configured full-suite file list. |
+| `--include-inductor-all-tests` | Full-suite mode | Add PyTorch CI `inductor_core` test files from `--pytorch-path`; implies `--all-tests`. |
+| `--include-triton-nightly-inductor-tests` | Full-suite mode | Add ROCm torch-triton-nightly Inductor validation files; implies `--all-tests`. |
+| `--rerun-failed LOG_FILE` | Rerun-failed mode | Rerun failed tests from a previous text log. |
+| `--rerun-include-timeouts` | Rerun-failed mode | Also rerun timed-out tests from the previous log. |
+| `--pytorch-path PATH` | All modes | Path to the PyTorch checkout. |
+| `--log-file PATH` | All modes except `--collect-only` | Path for the run log. |
+| `--stop-on-failure` | All execution modes | Stop after first failing test or fallback failure. |
+| `--batch-mode {file,shard,test}` | Full-suite mode only | Full-suite execution granularity. Default: `file`. |
+| `--per-file-timeout SECONDS` | Full-suite `file`/`shard` batch modes | Outer timeout for file or shard subprocesses. Default: 43200. |
+| `--shard-size N` | Full-suite `shard` mode and automatic opinfo sharding | Number of pytest node IDs per shard. Default: 100. |
+| `--per-test-timeout SECONDS` | All execution modes | Pytest-timeout per-test timeout. Default: 1200. |
+| `--resume` | CSV and full-suite modes | Resume from the next test after the last checkpoint. |
+| `--no-checkpoint` | All execution modes | Disable checkpoint writing and resume handling. |
+| `--regex PATTERN` | Full-suite mode only | Filter discovered pytest node IDs by regex. |
+| `-i`, `--input-files FILE [FILE ...]` | Full-suite mode only | Add files under `PYTORCH_PATH/test/`. |
+| `--collect-only` | CSV, full-suite, and rerun-failed modes | Count tests only; do not execute tests or write a log. |
 
 ## Examples
 
@@ -215,6 +259,9 @@ python run_tests.py tests.csv --pytorch-path /path/to/pytorch --per-test-timeout
 
 # Run full suite in default file mode
 python run_tests.py --all-tests --pytorch-path /path/to/pytorch
+
+# Run full suite in 100-test shards
+python run_tests.py --all-tests --batch-mode shard --shard-size 100 --pytorch-path /path/to/pytorch
 
 # Run full suite with historical per-test-node subprocess behavior
 python run_tests.py --all-tests --batch-mode test --pytorch-path /path/to/pytorch
