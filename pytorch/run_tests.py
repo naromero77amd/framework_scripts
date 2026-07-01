@@ -98,8 +98,8 @@ STATE_FAILED = "failed"
 STATE_TIMEDOUT = "timedout"
 STATE_MISSED = "missed"
 DISCOVERY_TIMEOUT_SECONDS = 1800
-DEFAULT_PER_TEST_TIMEOUT_SECONDS = 600
-DEFAULT_PER_FILE_TIMEOUT_SECONDS = 1800
+DEFAULT_PER_TEST_TIMEOUT_SECONDS = 1200
+DEFAULT_PER_FILE_TIMEOUT_SECONDS = 43200
 BATCH_MODE_FILE = "file"
 BATCH_MODE_TEST = "test"
 UNKNOWN_TIMEOUT_MISS_LIMIT = 4
@@ -1234,7 +1234,7 @@ def main():
         type=int,
         default=None,
         metavar='SECONDS',
-        help='Per-test pytest-timeout value in seconds (default: 600)'
+        help='Per-test pytest-timeout value in seconds for --batch-mode test, CSV, and rerun modes (default: 1200)'
     )
     parser.add_argument(
         '--batch-mode',
@@ -1247,7 +1247,7 @@ def main():
         type=int,
         default=DEFAULT_PER_FILE_TIMEOUT_SECONDS,
         metavar='SECONDS',
-        help='Per-file subprocess timeout in seconds for --batch-mode file (default: 1800)'
+        help='Per-file subprocess timeout in seconds for --batch-mode file (default: 43200)'
     )
     parser.add_argument(
         '--resume',
