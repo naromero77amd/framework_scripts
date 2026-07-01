@@ -91,8 +91,8 @@ File mode is the default. It runs one pytest subprocess per test file:
 pytest test/inductor/test_config.py --junitxml <tempfile>
 ```
 
-- Timeout is controlled by `--per-file-timeout` (default: 600 seconds).
-- Per-test pytest-timeout is still enabled inside the file subprocess via `--per-test-timeout` (default: 300 seconds).
+- Timeout is controlled by `--per-file-timeout` (default: 1800 seconds, matching upstream PyTorch's normal CI module timeout).
+- Per-test pytest-timeout is still enabled inside the file subprocess via `--per-test-timeout` (default: 600 seconds).
 - Passing files are parsed from pytest's JUnit XML output so per-test pass/skip/fail/error counts remain available.
 - This is the fastest mode because PyTorch and pytest startup costs are paid once per file instead of once per pytest node.
 
@@ -104,7 +104,7 @@ Test mode preserves the historical behavior: each discovered pytest node runs in
 pytest --timeout 300 test/inductor/test_config.py::TestInductorConfig::test_set
 ```
 
-- Timeout is controlled by `--per-test-timeout` (default: 300 seconds).
+- Timeout is controlled by `--per-test-timeout` (default: 600 seconds).
 - The pytest-timeout plugin enforces the test timeout.
 - The script also applies an outer subprocess timeout of timeout + 60 seconds as a safety net for cases where pytest-timeout does not terminate a stuck process cleanly.
 
@@ -199,8 +199,8 @@ Each test is classified into exactly one state:
 | `--log-file PATH` | No | Path for the run log. |
 | `--stop-on-failure` | No | Stop after first failing test or fallback failure. |
 | `--batch-mode {file,test}` | No | Full-suite execution granularity. Default: `file`. |
-| `--per-file-timeout SECONDS` | No | Outer timeout for file subprocesses in `--batch-mode file`. Default: 600. |
-| `--per-test-timeout SECONDS` | No | Pytest-timeout per-test timeout. Default: 300. |
+| `--per-file-timeout SECONDS` | No | Outer timeout for file subprocesses in `--batch-mode file`. Default: 1800. |
+| `--per-test-timeout SECONDS` | No | Pytest-timeout per-test timeout. Default: 600. |
 | `--resume` | No | Resume from the next test after the last checkpoint. |
 | `--no-checkpoint` | No | Disable checkpoint writing and resume handling. |
 | `--regex PATTERN` | No | Full-suite only. Filter discovered pytest node IDs by regex. |

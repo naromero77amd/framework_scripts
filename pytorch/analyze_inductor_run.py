@@ -26,6 +26,10 @@ RERUN_FIVE_SUITE_FILES = [
     "inductor/test_cudagraph_trees_expandable_segments.py",
     "inductor/test_torchinductor_opinfo.py",
 ]
+RERUN_CUDAGRAPH_SUITE_FILES = [
+    "inductor/test_cudagraph_trees.py",
+    "inductor/test_cudagraph_trees_expandable_segments.py",
+]
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -195,6 +199,8 @@ def discover_expected_nodes(meta: dict[str, str], pytorch_root: Path) -> list[st
             ]
         elif meta.get("FILES") == "rerun_five_suites":
             test_file_rel_paths = [str(Path("test") / f) for f in RERUN_FIVE_SUITE_FILES]
+        elif meta.get("FILES") == "rerun_cudagraph_suites":
+            test_file_rel_paths = [str(Path("test") / f) for f in RERUN_CUDAGRAPH_SUITE_FILES]
         else:
             return []
         return run_tests.discover_tests(
