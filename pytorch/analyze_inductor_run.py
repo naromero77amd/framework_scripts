@@ -15,7 +15,7 @@ import importlib.util
 from pathlib import Path
 
 
-STATUS_RE = re.compile(r"^(?:✓|✗)\s+(PASSED|SKIPPED|ERROR|FAILED|TIMEDOUT|MISSED)\s+\(([\d.]+)s\)")
+STATUS_RE = re.compile(r"^(?:✓|✗)\s+(PASSED|SKIPPED|XFAILED|ERROR|FAILED|TIMEDOUT|MISSED)\s+\(([\d.]+)s\)")
 PROGRESS_RE = re.compile(r"^\[(\d+)/(\d+)\]\s*$")
 RUNNING_RE = re.compile(r"^Running:\s+(.+)$")
 SUMMARY_RE = re.compile(r"^([A-Za-z ]+):\s+(\d+)\s*$")
@@ -162,17 +162,18 @@ def load_checkpoint(path: Path) -> dict[str, object] | None:
 
 
 def format_count_table(rows: list[tuple[str, collections.Counter]]) -> str:
-    header = "| Test Suite | Total | Passed | Skipped | Failed | Error | Timed Out | Missed | In Progress |\n"
-    sep = "|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+    header = "| Test Suite | Total | Passed | Skipped | Xfailed | Failed | Error | Timed Out | Missed | In Progress |\n"
+    sep = "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
     body = []
     for suite, counter in rows:
         total = sum(counter.values())
         body.append(
-            "| {suite} | {total} | {passed} | {skipped} | {failed} | {error} | {timedout} | {missed} | {in_progress} |".format(
+            "| {suite} | {total} | {passed} | {skipped} | {xfailed} | {failed} | {error} | {timedout} | {missed} | {in_progress} |".format(
                 suite=suite,
                 total=total,
                 passed=counter["passed"],
                 skipped=counter["skipped"],
+                xfailed=counter["xfailed"],
                 failed=counter["failed"],
                 error=counter["error"],
                 timedout=counter["timedout"],
@@ -311,6 +312,7 @@ def main() -> None:
     lines.append(f"- Completed: `{completed} / {total}` (`{pct:.2f}%`)")
     lines.append(f"- Passed: `{state_counts['passed']}`")
     lines.append(f"- Skipped: `{state_counts['skipped']}`")
+    lines.append(f"- Xfailed: `{state_counts['xfailed']}`")
     lines.append(f"- Failed: `{state_counts['failed']}`")
     lines.append(f"- Error: `{state_counts['error']}`")
     lines.append(f"- Timed out: `{state_counts['timedout']}`")

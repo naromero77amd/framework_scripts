@@ -101,7 +101,7 @@ pytest test/inductor/test_config.py --junitxml <tempfile>
 
 - Timeout is controlled by `--per-file-timeout` (default: 43200 seconds / 12 hours).
 - Per-test pytest-timeout is still enabled inside the file subprocess via `--per-test-timeout` (default: 1200 seconds / 20 minutes).
-- Passing files are parsed from pytest's JUnit XML output so per-test pass/skip/fail/error counts remain available.
+- Passing files are parsed from pytest's JUnit XML output so per-test pass/skip/xfail/fail/error counts remain available.
 - This is the fastest mode because PyTorch and pytest startup costs are paid once per file instead of once per pytest node.
 - `test/inductor/test_torchinductor_opinfo.py` is automatically run in shard batches in file mode because one full-file pytest subprocess can be too large or crash before complete JUnit output is written.
 
@@ -198,6 +198,7 @@ Each test is classified into exactly one state:
 |-------|---------|
 | PASSED | Exit code 0 and output does not indicate a skip. |
 | SKIPPED | Exit code 0 and output indicates the test was skipped. |
+| XFAILED | Pytest reported an expected failure (`XFAIL`). This is tracked separately from skipped tests and is not treated as a bad outcome. |
 | ERROR | Non-zero exit and `RuntimeError` appears in stdout or stderr. |
 | FAILED | Non-zero exit and no `RuntimeError` appears in output. |
 | TIMEDOUT | The test or fallback test hit its timeout. |
@@ -212,8 +213,8 @@ Each test is classified into exactly one state:
   - a progress line: `[N/TOTAL]`
   - a `Running: <test_name>` header
   - test output, when available
-  - a status line: `PASSED`, `SKIPPED`, `ERROR`, `FAILED`, `TIMEDOUT`, or `MISSED`
-- The final summary includes total run count, pass/skip/error/fail/timeout/missed counts, total time, and per-state test lists.
+  - a status line: `PASSED`, `SKIPPED`, `XFAILED`, `ERROR`, `FAILED`, `TIMEDOUT`, or `MISSED`
+- The final summary includes total run count, pass/skip/xfail/error/fail/timeout/missed counts, total time, and per-state test lists.
 - `--rerun-failed` uses the `Failed tests:` and `Timed out tests:` summary sections.
 - File and shard batch modes create temporary JUnit XML files internally for per-test result attribution, but those XML files are not the public report format and are not used by rerun-failed mode.
 
@@ -224,7 +225,7 @@ Each test is classified into exactly one state:
 - It reads the log path and checkpoint path from the metadata file passed with `--meta`.
 - It parses progress lines, `Running:` headers, and status lines from the log.
 - It uses the checkpoint to report progress for active or resumable runs.
-- It works across full-suite `file`, `shard`, and `test` batch modes because all of them write the same per-test log records.
+- It works across full-suite `file`, `shard`, and `test` batch modes because all of them write the same per-test log records, including `XFAILED`.
 - It can also parse CSV and rerun-failed logs if the metadata file points at those logs.
 - For completed framework runs with known metadata file sets, it may rediscover expected pytest nodes and mark unrecorded tests as `MISSED`; this rediscovery is separate from JUnit XML.
 

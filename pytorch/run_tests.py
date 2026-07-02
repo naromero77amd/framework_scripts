@@ -93,6 +93,7 @@ class TeeOutput:
 # Test outcome states (each test has exactly one)
 STATE_PASSED = "passed"
 STATE_SKIPPED = "skipped"
+STATE_XFAILED = "xfailed"
 STATE_ERROR = "error"
 STATE_FAILED = "failed"
 STATE_TIMEDOUT = "timedout"
@@ -106,6 +107,23 @@ BATCH_MODE_SHARD = "shard"
 BATCH_MODE_TEST = "test"
 DEFAULT_SHARDED_FILE_SUFFIXES = ("test/inductor/test_torchinductor_opinfo.py",)
 UNKNOWN_TIMEOUT_MISS_LIMIT = 4
+
+
+def _is_success_state(state: str) -> bool:
+    """Return True for states that should not fail the runner."""
+    return state in (STATE_PASSED, STATE_SKIPPED, STATE_XFAILED)
+
+
+def _output_indicates_xfailed(stdout: str, stderr: str) -> bool:
+    """True if pytest output indicates an expected failure."""
+    combined = (stdout or "") + "\n" + (stderr or "")
+    return " XFAIL" in combined or re.search(r"\d+\s+xfailed", combined)
+
+
+def _output_indicates_xpassed(stdout: str, stderr: str) -> bool:
+    """True if pytest output indicates an unexpected pass."""
+    combined = (stdout or "") + "\n" + (stderr or "")
+    return " XPASS" in combined or re.search(r"\d+\s+xpassed", combined)
 
 
 def _output_indicates_skipped(stdout: str, stderr: str) -> bool:
@@ -150,7 +168,8 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
 
     Returns:
         tuple: (success: bool, elapsed_time: float, timed_out: bool, state: str)
-        state is one of STATE_PASSED, STATE_SKIPPED, STATE_ERROR, STATE_FAILED, STATE_TIMEDOUT.
+        state is one of STATE_PASSED, STATE_SKIPPED, STATE_XFAILED, STATE_ERROR,
+        STATE_FAILED, STATE_TIMEDOUT.
     """
     test_file = Path(pytorch_path) / TEST_FILE_REL_PATH
 
@@ -183,19 +202,26 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         result = subprocess.run(cmd, **run_kw)
         
         elapsed_time = time.time() - start_time
-        success = result.returncode == 0
         stdout_str = result.stdout or ""
         stderr_str = result.stderr or ""
         timed_out = False
 
-        if success:
-            state = STATE_SKIPPED if _output_indicates_skipped(stdout_str, stderr_str) else STATE_PASSED
+        if _output_indicates_xpassed(stdout_str, stderr_str):
+            state = STATE_FAILED
+        elif result.returncode == 0:
+            if _output_indicates_xfailed(stdout_str, stderr_str):
+                state = STATE_XFAILED
+            elif _output_indicates_skipped(stdout_str, stderr_str):
+                state = STATE_SKIPPED
+            else:
+                state = STATE_PASSED
         else:
             if _output_indicates_timeout(stdout_str, stderr_str):
                 state = STATE_TIMEDOUT
                 timed_out = True
             else:
                 state = STATE_ERROR if _output_indicates_runtime_error(stdout_str, stderr_str) else STATE_FAILED
+        success = _is_success_state(state)
 
         # Write all output to log file
         if result.stdout:
@@ -208,6 +234,7 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         status_map = {
             STATE_PASSED: "✓ PASSED",
             STATE_SKIPPED: "✓ SKIPPED",
+            STATE_XFAILED: "✓ XFAILED",
             STATE_ERROR: "✗ ERROR",
             STATE_FAILED: "✗ FAILED",
             STATE_TIMEDOUT: "✗ TIMEDOUT",
@@ -304,8 +331,9 @@ def _parse_junit_testcases(junit_path):
         classname = testcase.attrib.get("classname", "")
         name = testcase.attrib.get("name", "")
         node_hint = _junit_node_hint(classname, name)
-        if testcase.find("skipped") is not None:
-            state = STATE_SKIPPED
+        skipped = testcase.find("skipped")
+        if skipped is not None:
+            state = _junit_skipped_state(skipped)
         elif testcase.find("error") is not None:
             state = STATE_ERROR
         elif testcase.find("failure") is not None:
@@ -314,6 +342,16 @@ def _parse_junit_testcases(junit_path):
             state = STATE_PASSED
         cases.append((node_hint, state, elapsed))
     return cases
+
+
+def _junit_skipped_state(skipped):
+    """Distinguish ordinary pytest skips from expected failures in JUnit XML."""
+    skipped_type = (skipped.attrib.get("type") or "").lower()
+    skipped_message = (skipped.attrib.get("message") or "").lower()
+    skipped_text = (skipped.text or "").lower()
+    if "xfail" in skipped_type or "xfail" in skipped_message or "xfail" in skipped_text:
+        return STATE_XFAILED
+    return STATE_SKIPPED
 
 
 def _junit_node_hint(classname: str, name: str) -> str:
@@ -372,7 +410,7 @@ def _parse_verbose_node_results(output: str):
         "SKIPPED": STATE_SKIPPED,
         "FAILED": STATE_FAILED,
         "ERROR": STATE_ERROR,
-        "XFAIL": STATE_SKIPPED,
+        "XFAIL": STATE_XFAILED,
         "XPASS": STATE_FAILED,
     }
     pattern = re.compile(
@@ -389,7 +427,7 @@ def _parse_verbose_node_results(output: str):
         state = state_map[match.group("status")]
         results.append({
             'name': node,
-            'success': state in (STATE_PASSED, STATE_SKIPPED),
+            'success': _is_success_state(state),
             'time': elapsed,
             'timed_out': False,
             'state': state,
@@ -401,6 +439,7 @@ def _write_result_status(log_file, state, elapsed):
     status_map = {
         STATE_PASSED: "✓ PASSED",
         STATE_SKIPPED: "✓ SKIPPED",
+        STATE_XFAILED: "✓ XFAILED",
         STATE_ERROR: "✗ ERROR",
         STATE_FAILED: "✗ FAILED",
         STATE_TIMEDOUT: "✗ TIMEDOUT",
@@ -422,7 +461,7 @@ def _record_file_batch_result(node_id, state, elapsed, log_file, index, total):
     _write_result_status(log_file, state, elapsed)
     return {
         'name': node_id,
-        'success': state in (STATE_PASSED, STATE_SKIPPED),
+        'success': _is_success_state(state),
         'time': elapsed,
         'timed_out': state == STATE_TIMEDOUT,
         'state': state,
@@ -536,7 +575,7 @@ def _build_file_results(node_ids, testcase_states, file_name, log_file, elapsed,
             test_elapsed = 0.0
         results.append({
             'name': node_id,
-            'success': state in (STATE_PASSED, STATE_SKIPPED),
+            'success': _is_success_state(state),
             'time': test_elapsed,
             'timed_out': False,
             'state': state,
@@ -950,6 +989,7 @@ def _write_run_summary(results, start_time, log_file, summary_title):
     total_time = time.time() - start_time
     passed = sum(1 for r in results if r.get('state') == STATE_PASSED)
     skipped_count = sum(1 for r in results if r.get('state') == STATE_SKIPPED)
+    xfailed_count = sum(1 for r in results if r.get('state') == STATE_XFAILED)
     error_count = sum(1 for r in results if r.get('state') == STATE_ERROR)
     failed_count = sum(1 for r in results if r.get('state') == STATE_FAILED)
     timedout_count = sum(1 for r in results if r.get('state') == STATE_TIMEDOUT)
@@ -958,6 +998,7 @@ def _write_run_summary(results, start_time, log_file, summary_title):
     summary += f"Total tests run: {len(results)}\n"
     summary += f"Passed: {passed}\n"
     summary += f"Skipped: {skipped_count}\n"
+    summary += f"Xfailed: {xfailed_count}\n"
     summary += f"Error: {error_count}\n"
     summary += f"Failed: {failed_count}\n"
     summary += f"Timed out: {timedout_count}\n"
@@ -966,6 +1007,7 @@ def _write_run_summary(results, start_time, log_file, summary_title):
     for state, label in [
         (STATE_PASSED, "Passed"),
         (STATE_SKIPPED, "Skipped"),
+        (STATE_XFAILED, "Xfailed"),
         (STATE_ERROR, "Error"),
         (STATE_FAILED, "Failed"),
         (STATE_TIMEDOUT, "Timed out"),
