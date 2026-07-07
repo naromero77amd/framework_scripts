@@ -171,6 +171,7 @@ Python helpers such as `_should_use_multimem_all_gather_matmul` and `_multimem_a
 
 **Status / next steps:** Track rocSHMEM feature growth; avoid labeling multicast-dependent APIs as cross-vendor without runtime guards.
 
+> Nick's notes: confer with Prachi, we've integrated rocSHMEM for all the features it can support; but rocSHMEM itself is limited by the hardware - expect changes beyond MI455.
 ---
 
 ### 5. Tensor Memory Accelerator (TMA) and CUDA-Specific Codegen
@@ -199,6 +200,8 @@ This means ROCm may take TMA-named code paths in templates but without true TMA 
 **Impact:** Latest NVIDIA kernel codegen advantages (TMA loads/stores, persistent TMA pipelines, CuTeDSL block-scaled GEMM) do not translate directly to ROCm. This is expected hardware divergence, not a simple wiring bug.
 
 **Status / next steps:** Classify TMA-dependent optimizations as CUDA-only in docs; pursue AMD-specific memory hierarchy optimizations (buffer loads, LDS tiling) as the ROCm counterpart.
+
+> Nick's notes: Nick and Glen are working on this. Tensor Memory Accelerator (Nvidia), ours is Tensor Data Mover (TDM). First version will be in MI450. This falls under MI450 umbrella [TODO] - Marco to follow up on these specific stories so that we can announce TMA support with MI450 launch.
 
 ---
 
@@ -229,6 +232,8 @@ NVFP4/MXFP4 dtype support (`float4_e2m1fn_x2`) exists at the type level, but per
 **Impact:** Cutting-edge sub-byte training/inference kernels targeting Blackwell/Hopper are effectively CUDA-only. MI300/MI350 have growing FP8 support but not full MXFP4/NVFP4 parity.
 
 **Status / next steps:** Needs verification on whether AITER/MSLK ROCm paths will cover MXFP4 grouped GEMM; track `gfx950` MX GEMM maturity separately from NVFP4.
+
+> Nick's notes: Not sure if FP8 sparse really exists? Follow up with Jagadish. MSLK is the new name for FBGEMM (aka FaceBook GEMM, a meta library that support some low precision data types). This is not just about FP8. Story behind NVFP4; AMD chose emulation. FB and MS expressed that they wanted HW support, for NVFP4. Will this be supported in MI450?
 
 ---
 
@@ -299,6 +304,8 @@ FlexAttention is not globally disabled on ROCm — platform detection uses `torc
 **Impact:** FlexAttention may work on ROCm for common cases, but fusion / combo-kernel optimizations and TMA-specialized paths lag CUDA validation.
 
 **Status / next steps:** Triage ROCm combo-kernel issues; confirm which skips indicate missing functionality vs. test infra gaps.
+
+> Nick's notes: Bring this up with Jack, find where falls on his list of priorities
 
 ---
 
