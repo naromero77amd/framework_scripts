@@ -93,16 +93,37 @@ class TeeOutput:
 # Test outcome states (each test has exactly one)
 STATE_PASSED = "passed"
 STATE_SKIPPED = "skipped"
+STATE_XFAILED = "xfailed"
 STATE_ERROR = "error"
 STATE_FAILED = "failed"
 STATE_TIMEDOUT = "timedout"
 STATE_MISSED = "missed"
 DISCOVERY_TIMEOUT_SECONDS = 1800
-DEFAULT_PER_TEST_TIMEOUT_SECONDS = 300
-DEFAULT_PER_FILE_TIMEOUT_SECONDS = 600
+DEFAULT_PER_TEST_TIMEOUT_SECONDS = 1200
+DEFAULT_PER_FILE_TIMEOUT_SECONDS = 43200
+DEFAULT_SHARD_SIZE = 100
 BATCH_MODE_FILE = "file"
+BATCH_MODE_SHARD = "shard"
 BATCH_MODE_TEST = "test"
+DEFAULT_SHARDED_FILE_SUFFIXES = ("test/inductor/test_torchinductor_opinfo.py",)
 UNKNOWN_TIMEOUT_MISS_LIMIT = 4
+
+
+def _is_success_state(state: str) -> bool:
+    """Return True for states that should not fail the runner."""
+    return state in (STATE_PASSED, STATE_SKIPPED, STATE_XFAILED)
+
+
+def _output_indicates_xfailed(stdout: str, stderr: str) -> bool:
+    """True if pytest output indicates an expected failure."""
+    combined = (stdout or "") + "\n" + (stderr or "")
+    return " XFAIL" in combined or re.search(r"\d+\s+xfailed", combined)
+
+
+def _output_indicates_xpassed(stdout: str, stderr: str) -> bool:
+    """True if pytest output indicates an unexpected pass."""
+    combined = (stdout or "") + "\n" + (stderr or "")
+    return " XPASS" in combined or re.search(r"\d+\s+xpassed", combined)
 
 
 def _output_indicates_skipped(stdout: str, stderr: str) -> bool:
@@ -147,7 +168,8 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
 
     Returns:
         tuple: (success: bool, elapsed_time: float, timed_out: bool, state: str)
-        state is one of STATE_PASSED, STATE_SKIPPED, STATE_ERROR, STATE_FAILED, STATE_TIMEDOUT.
+        state is one of STATE_PASSED, STATE_SKIPPED, STATE_XFAILED, STATE_ERROR,
+        STATE_FAILED, STATE_TIMEDOUT.
     """
     test_file = Path(pytorch_path) / TEST_FILE_REL_PATH
 
@@ -180,19 +202,26 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         result = subprocess.run(cmd, **run_kw)
         
         elapsed_time = time.time() - start_time
-        success = result.returncode == 0
         stdout_str = result.stdout or ""
         stderr_str = result.stderr or ""
         timed_out = False
 
-        if success:
-            state = STATE_SKIPPED if _output_indicates_skipped(stdout_str, stderr_str) else STATE_PASSED
+        if _output_indicates_xpassed(stdout_str, stderr_str):
+            state = STATE_FAILED
+        elif result.returncode == 0:
+            if _output_indicates_xfailed(stdout_str, stderr_str):
+                state = STATE_XFAILED
+            elif _output_indicates_skipped(stdout_str, stderr_str):
+                state = STATE_SKIPPED
+            else:
+                state = STATE_PASSED
         else:
             if _output_indicates_timeout(stdout_str, stderr_str):
                 state = STATE_TIMEDOUT
                 timed_out = True
             else:
                 state = STATE_ERROR if _output_indicates_runtime_error(stdout_str, stderr_str) else STATE_FAILED
+        success = _is_success_state(state)
 
         # Write all output to log file
         if result.stdout:
@@ -205,6 +234,7 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         status_map = {
             STATE_PASSED: "✓ PASSED",
             STATE_SKIPPED: "✓ SKIPPED",
+            STATE_XFAILED: "✓ XFAILED",
             STATE_ERROR: "✗ ERROR",
             STATE_FAILED: "✗ FAILED",
             STATE_TIMEDOUT: "✗ TIMEDOUT",
@@ -271,11 +301,24 @@ def _group_node_ids_by_file(test_names):
     return groups
 
 
+def _chunk_node_ids(node_ids, shard_size):
+    """Split pytest node ids into fixed-size shards."""
+    return [node_ids[i:i + shard_size] for i in range(0, len(node_ids), shard_size)]
+
+
+def _is_default_sharded_file(file_name):
+    """Return True for files that are too large/flaky for one file-level subprocess."""
+    normalized = file_name.replace("\\", "/")
+    return any(normalized.endswith(suffix) for suffix in DEFAULT_SHARDED_FILE_SUFFIXES)
+
+
 def _parse_junit_testcases(junit_path):
     """
     Return per-testcase states from pytest's JUnit XML in execution order.
 
-    Each item is (state, elapsed). State is one of passed, skipped, failed, error.
+    Each item is (node_hint, state, elapsed). State is one of passed, skipped,
+    failed, error. node_hint is a best-effort pytest node id fragment from
+    JUnit classname/name.
     """
     try:
         root = ET.parse(junit_path).getroot()
@@ -285,16 +328,65 @@ def _parse_junit_testcases(junit_path):
     cases = []
     for testcase in root.iter("testcase"):
         elapsed = float(testcase.attrib.get("time", "0") or 0)
-        if testcase.find("skipped") is not None:
-            state = STATE_SKIPPED
+        classname = testcase.attrib.get("classname", "")
+        name = testcase.attrib.get("name", "")
+        node_hint = _junit_node_hint(classname, name)
+        skipped = testcase.find("skipped")
+        if skipped is not None:
+            state = _junit_skipped_state(skipped)
         elif testcase.find("error") is not None:
             state = STATE_ERROR
         elif testcase.find("failure") is not None:
             state = STATE_FAILED
         else:
             state = STATE_PASSED
-        cases.append((state, elapsed))
+        cases.append((node_hint, state, elapsed))
     return cases
+
+
+def _junit_skipped_state(skipped):
+    """Distinguish ordinary pytest skips from expected failures in JUnit XML."""
+    skipped_type = (skipped.attrib.get("type") or "").lower()
+    skipped_message = (skipped.attrib.get("message") or "").lower()
+    skipped_text = (skipped.text or "").lower()
+    if "xfail" in skipped_type or "xfail" in skipped_message or "xfail" in skipped_text:
+        return STATE_XFAILED
+    return STATE_SKIPPED
+
+
+def _junit_node_hint(classname: str, name: str) -> str:
+    """Convert pytest JUnit classname/name into a pytest-node-like hint."""
+    if not classname:
+        return name
+    parts = classname.split(".")
+    class_name = parts[-1]
+    module_parts = parts[:-1]
+    if module_parts and module_parts[0] == "test":
+        file_part = "/".join(module_parts) + ".py"
+        return f"{file_part}::{class_name}::{name}"
+    return f"{classname}::{name}"
+
+
+def _match_junit_cases_to_nodes(node_ids, testcase_states):
+    """Match JUnit testcase records to discovered node ids by identity."""
+    unmatched = list(testcase_states)
+    matched = []
+    for node_id in node_ids:
+        found_index = None
+        for i, (node_hint, state, elapsed) in enumerate(unmatched):
+            if node_hint == node_id or node_id.endswith(node_hint) or node_hint.endswith(node_id):
+                found_index = i
+                break
+            # JUnit names often omit the leading test/ path in classname.
+            if node_id.split("/", 1)[-1].endswith(node_hint):
+                found_index = i
+                break
+        if found_index is None:
+            matched.append((node_id, None, None))
+            continue
+        _, state, elapsed = unmatched.pop(found_index)
+        matched.append((node_id, state, elapsed))
+    return matched, unmatched
 
 
 def _running_nodes_from_output(output: str):
@@ -318,7 +410,7 @@ def _parse_verbose_node_results(output: str):
         "SKIPPED": STATE_SKIPPED,
         "FAILED": STATE_FAILED,
         "ERROR": STATE_ERROR,
-        "XFAIL": STATE_SKIPPED,
+        "XFAIL": STATE_XFAILED,
         "XPASS": STATE_FAILED,
     }
     pattern = re.compile(
@@ -335,7 +427,7 @@ def _parse_verbose_node_results(output: str):
         state = state_map[match.group("status")]
         results.append({
             'name': node,
-            'success': state in (STATE_PASSED, STATE_SKIPPED),
+            'success': _is_success_state(state),
             'time': elapsed,
             'timed_out': False,
             'state': state,
@@ -347,6 +439,7 @@ def _write_result_status(log_file, state, elapsed):
     status_map = {
         STATE_PASSED: "✓ PASSED",
         STATE_SKIPPED: "✓ SKIPPED",
+        STATE_XFAILED: "✓ XFAILED",
         STATE_ERROR: "✗ ERROR",
         STATE_FAILED: "✗ FAILED",
         STATE_TIMEDOUT: "✗ TIMEDOUT",
@@ -368,7 +461,7 @@ def _record_file_batch_result(node_id, state, elapsed, log_file, index, total):
     _write_result_status(log_file, state, elapsed)
     return {
         'name': node_id,
-        'success': state in (STATE_PASSED, STATE_SKIPPED),
+        'success': _is_success_state(state),
         'time': elapsed,
         'timed_out': state == STATE_TIMEDOUT,
         'state': state,
@@ -464,21 +557,25 @@ def _run_file_batch(file_name, node_ids, args, log_file):
 
 def _build_file_results(node_ids, testcase_states, file_name, log_file, elapsed, allow_partial=False):
     """Build result dictionaries from JUnit testcase states."""
-    if len(testcase_states) != len(node_ids) and not allow_partial:
-        msg = (
-            f"✗ FILE RESULT MISMATCH ({file_name}): collected {len(node_ids)} node(s), "
-            f"but JUnit reported {len(testcase_states)} testcase(s).\n"
-        )
+    matched, extra_cases = _match_junit_cases_to_nodes(node_ids, testcase_states)
+    missing_count = sum(1 for _, state, _ in matched if state is None)
+    if (missing_count or extra_cases) and not allow_partial:
+        msg = f"JUnit result mismatch ({file_name}): "
+        msg += f"{missing_count} discovered node(s) missing, {len(extra_cases)} extra testcase(s).\n"
         print(msg, end='')
         log_file.write(msg)
         log_file.flush()
-        return [], "mismatch", elapsed, None
 
     results = []
-    for node_id, (state, test_elapsed) in zip(node_ids, testcase_states):
+    for node_id, state, test_elapsed in matched:
+        if state is None:
+            if allow_partial:
+                continue
+            state = STATE_MISSED
+            test_elapsed = 0.0
         results.append({
             'name': node_id,
-            'success': state in (STATE_PASSED, STATE_SKIPPED),
+            'success': _is_success_state(state),
             'time': test_elapsed,
             'timed_out': False,
             'state': state,
@@ -892,6 +989,7 @@ def _write_run_summary(results, start_time, log_file, summary_title):
     total_time = time.time() - start_time
     passed = sum(1 for r in results if r.get('state') == STATE_PASSED)
     skipped_count = sum(1 for r in results if r.get('state') == STATE_SKIPPED)
+    xfailed_count = sum(1 for r in results if r.get('state') == STATE_XFAILED)
     error_count = sum(1 for r in results if r.get('state') == STATE_ERROR)
     failed_count = sum(1 for r in results if r.get('state') == STATE_FAILED)
     timedout_count = sum(1 for r in results if r.get('state') == STATE_TIMEDOUT)
@@ -900,6 +998,7 @@ def _write_run_summary(results, start_time, log_file, summary_title):
     summary += f"Total tests run: {len(results)}\n"
     summary += f"Passed: {passed}\n"
     summary += f"Skipped: {skipped_count}\n"
+    summary += f"Xfailed: {xfailed_count}\n"
     summary += f"Error: {error_count}\n"
     summary += f"Failed: {failed_count}\n"
     summary += f"Timed out: {timedout_count}\n"
@@ -908,6 +1007,7 @@ def _write_run_summary(results, start_time, log_file, summary_title):
     for state, label in [
         (STATE_PASSED, "Passed"),
         (STATE_SKIPPED, "Skipped"),
+        (STATE_XFAILED, "Xfailed"),
         (STATE_ERROR, "Error"),
         (STATE_FAILED, "Failed"),
         (STATE_TIMEDOUT, "Timed out"),
@@ -994,10 +1094,142 @@ def _run_test_batch(test_names, start_index, args, log_file, mode, by_id, count_
     return _write_run_summary(results, start_time, log_file, summary_title)
 
 
-def _run_file_batch_mode(test_names, start_index, args, log_file, mode, count_msg, summary_title):
+def _run_file_node_group(file_name, node_ids, args, log_file, mode, test_names, node_index, results):
     """
-    Run discovered pytest node ids grouped by file. Failed or timed-out files
-    fall back to per-test-node execution for exact attribution.
+    Run one file-scoped group of node ids with the existing file-batch recovery.
+
+    The group may be a whole file or one shard from that file.
+    Returns (node_index, stop_requested).
+    """
+    remaining_nodes = node_ids[:]
+    unknown_timeout_misses = 0
+    file_done = False
+    while remaining_nodes and not file_done:
+        file_results, reason, elapsed, timed_out_node = _run_file_batch(
+            file_name, remaining_nodes, args, log_file
+        )
+        recorded_names = set()
+        for result in file_results:
+            node_index += 1
+            recorded = _record_file_batch_result(
+                result['name'], result['state'], result['time'],
+                log_file, node_index, len(test_names)
+            )
+            results.append(recorded)
+            recorded_names.add(result['name'])
+
+        if reason is None:
+            file_done = True
+            continue
+        if reason == "timeout" and timed_out_node and timed_out_node in remaining_nodes:
+            timeout_position = remaining_nodes.index(timed_out_node)
+            for node_id in remaining_nodes[:timeout_position]:
+                if node_id in recorded_names:
+                    continue
+                node_index += 1
+                recorded = _record_file_batch_result(
+                    node_id, STATE_MISSED, 0.0, log_file, node_index, len(test_names)
+                )
+                results.append(recorded)
+
+            if timed_out_node not in recorded_names:
+                node_index += 1
+                recorded = _record_file_batch_result(
+                    timed_out_node, STATE_TIMEDOUT, elapsed, log_file, node_index, len(test_names)
+                )
+                results.append(recorded)
+            else:
+                for result in reversed(results):
+                    if result['name'] == timed_out_node:
+                        result['state'] = STATE_TIMEDOUT
+                        result['success'] = False
+                        result['timed_out'] = True
+                        break
+            msg = f"Skipping timed-out test and continuing: {timed_out_node}\n"
+            print(msg, end='')
+            log_file.write(msg)
+            log_file.flush()
+            remaining_nodes = remaining_nodes[timeout_position + 1:]
+            unknown_timeout_misses = 0
+            continue
+
+        if reason == "timeout" and remaining_nodes:
+            missed_node = remaining_nodes[0]
+            unknown_timeout_misses += 1
+            node_index += 1
+            recorded = _record_file_batch_result(
+                missed_node, STATE_MISSED, elapsed, log_file, node_index, len(test_names)
+            )
+            results.append(recorded)
+            msg = (
+                f"Could not identify timed-out test in {file_name}; "
+                f"marking next unresolved test as missed ({unknown_timeout_misses}/"
+                f"{UNKNOWN_TIMEOUT_MISS_LIMIT}): {missed_node}\n"
+            )
+            print(msg, end='')
+            log_file.write(msg)
+            log_file.flush()
+            remaining_nodes = remaining_nodes[1:]
+            if unknown_timeout_misses >= UNKNOWN_TIMEOUT_MISS_LIMIT and remaining_nodes:
+                msg = (
+                    f"Reached {UNKNOWN_TIMEOUT_MISS_LIMIT} consecutive unidentified timeouts "
+                    f"in {file_name}; recording remaining tests as missed.\n"
+                )
+                print(msg, end='')
+                log_file.write(msg)
+                log_file.flush()
+                for node_id in remaining_nodes:
+                    node_index += 1
+                    recorded = _record_file_batch_result(
+                        node_id, STATE_MISSED, 0.0, log_file, node_index, len(test_names)
+                    )
+                    results.append(recorded)
+                remaining_nodes = []
+                file_done = True
+            continue
+
+        msg = (
+            f"Unable to continue {file_name} after file batch issue ({reason}). "
+            "Recording remaining tests as missed.\n"
+        )
+        print(msg, end='')
+        log_file.write(msg)
+        log_file.flush()
+        for node_id in remaining_nodes:
+            if node_id in recorded_names:
+                continue
+            node_index += 1
+            recorded = _record_file_batch_result(
+                node_id, STATE_MISSED, 0.0, log_file, node_index, len(test_names)
+            )
+            results.append(recorded)
+        file_done = True
+
+    if not remaining_nodes and not file_done:
+        file_done = True
+
+    checkpoint_index = node_index - 1
+    if not args.no_checkpoint and checkpoint_index >= 0:
+        last_test = test_names[checkpoint_index]
+        next_test = test_names[node_index] if node_index < len(test_names) else None
+        write_checkpoint(
+            args.log_file, last_test, next_test, checkpoint_index, len(test_names), mode,
+            csv_file=args.csv_file, pytorch_path=args.pytorch_path
+        )
+    stop_requested = args.stop_on_failure and any(not r['success'] for r in results[-len(node_ids):])
+    return node_index, stop_requested
+
+
+def _run_grouped_file_batch_mode(
+    test_names, start_index, args, log_file, mode, count_msg, summary_title,
+    shard_all=False, shard_default_files=False,
+):
+    """
+    Run discovered pytest node ids grouped by file.
+
+    When sharding is enabled, each file group is split into fixed-size chunks.
+    Each chunk still uses _run_file_batch so JUnit parsing, timeout recovery,
+    missed handling, and checkpointing stay consistent with file mode.
     """
     msg = f"{count_msg}\n\n"
     print(msg, end='')
@@ -1008,126 +1240,83 @@ def _run_file_batch_mode(test_names, start_index, args, log_file, mode, count_ms
     start_time = time.time()
     groups = _group_node_ids_by_file(test_names[start_index:])
     node_index = start_index
+    stop_requested = False
     for file_name, node_ids in groups:
-        remaining_nodes = node_ids[:]
-        unknown_timeout_misses = 0
-        file_done = False
-        while remaining_nodes and not file_done:
-            file_results, reason, elapsed, timed_out_node = _run_file_batch(
-                file_name, remaining_nodes, args, log_file
-            )
-            recorded_names = set()
-            for result in file_results:
-                node_index += 1
-                recorded = _record_file_batch_result(
-                    result['name'], result['state'], result['time'],
-                    log_file, node_index, len(test_names)
-                )
-                results.append(recorded)
-                recorded_names.add(result['name'])
-
-            if reason is None:
-                file_done = True
-                continue
-            if reason == "timeout" and timed_out_node and timed_out_node in remaining_nodes:
-                timeout_position = remaining_nodes.index(timed_out_node)
-                for node_id in remaining_nodes[:timeout_position]:
-                    if node_id in recorded_names:
-                        continue
-                    node_index += 1
-                    recorded = _record_file_batch_result(
-                        node_id, STATE_MISSED, 0.0, log_file, node_index, len(test_names)
-                    )
-                    results.append(recorded)
-
-                if timed_out_node not in recorded_names:
-                    node_index += 1
-                    recorded = _record_file_batch_result(
-                        timed_out_node, STATE_TIMEDOUT, elapsed, log_file, node_index, len(test_names)
-                    )
-                    results.append(recorded)
-                else:
-                    for result in reversed(results):
-                        if result['name'] == timed_out_node:
-                            result['state'] = STATE_TIMEDOUT
-                            result['success'] = False
-                            result['timed_out'] = True
-                            break
-                msg = f"Skipping timed-out test and continuing: {timed_out_node}\n"
-                print(msg, end='')
-                log_file.write(msg)
-                log_file.flush()
-                remaining_nodes = remaining_nodes[timeout_position + 1:]
-                unknown_timeout_misses = 0
-                continue
-
-            if reason == "timeout" and remaining_nodes:
-                missed_node = remaining_nodes[0]
-                unknown_timeout_misses += 1
-                node_index += 1
-                recorded = _record_file_batch_result(
-                    missed_node, STATE_MISSED, elapsed, log_file, node_index, len(test_names)
-                )
-                results.append(recorded)
-                msg = (
-                    f"Could not identify timed-out test in {file_name}; "
-                    f"marking next unresolved test as missed ({unknown_timeout_misses}/"
-                    f"{UNKNOWN_TIMEOUT_MISS_LIMIT}): {missed_node}\n"
-                )
-                print(msg, end='')
-                log_file.write(msg)
-                log_file.flush()
-                remaining_nodes = remaining_nodes[1:]
-                if unknown_timeout_misses >= UNKNOWN_TIMEOUT_MISS_LIMIT and remaining_nodes:
-                    msg = (
-                        f"Reached {UNKNOWN_TIMEOUT_MISS_LIMIT} consecutive unidentified timeouts "
-                        f"in {file_name}; recording remaining tests as missed.\n"
-                    )
-                    print(msg, end='')
-                    log_file.write(msg)
-                    log_file.flush()
-                    for node_id in remaining_nodes:
-                        node_index += 1
-                        recorded = _record_file_batch_result(
-                            node_id, STATE_MISSED, 0.0, log_file, node_index, len(test_names)
-                        )
-                        results.append(recorded)
-                    remaining_nodes = []
-                    file_done = True
-                continue
-
+        should_shard = shard_all or (shard_default_files and _is_default_sharded_file(file_name))
+        chunks = _chunk_node_ids(node_ids, args.shard_size) if should_shard else [node_ids]
+        if should_shard:
             msg = (
-                f"Unable to continue {file_name} after file batch issue ({reason}). "
-                "Recording remaining tests as missed.\n"
+                f"Running {file_name} in {len(chunks)} shard(s) "
+                f"of up to {args.shard_size} test(s).\n"
             )
             print(msg, end='')
             log_file.write(msg)
             log_file.flush()
-            for node_id in remaining_nodes:
-                if node_id in recorded_names:
-                    continue
-                node_index += 1
-                recorded = _record_file_batch_result(
-                    node_id, STATE_MISSED, 0.0, log_file, node_index, len(test_names)
+        for shard_index, chunk in enumerate(chunks, start=1):
+            if should_shard:
+                msg = (
+                    f"Shard {shard_index}/{len(chunks)} for {file_name}: "
+                    f"{len(chunk)} test(s)\n"
                 )
-                results.append(recorded)
-            file_done = True
-
-        if not remaining_nodes and not file_done:
-            file_done = True
-
-        checkpoint_index = node_index - 1
-        if not args.no_checkpoint and checkpoint_index >= 0:
-            last_test = test_names[checkpoint_index]
-            next_test = test_names[node_index] if node_index < len(test_names) else None
-            write_checkpoint(
-                args.log_file, last_test, next_test, checkpoint_index, len(test_names), mode,
-                csv_file=args.csv_file, pytorch_path=args.pytorch_path
+                print(msg, end='')
+                log_file.write(msg)
+                log_file.flush()
+            node_index, stop_requested = _run_file_node_group(
+                file_name, chunk, args, log_file, mode, test_names, node_index, results
             )
-        if args.stop_on_failure and any(not r['success'] for r in results[-len(node_ids):]):
+            if stop_requested:
+                break
+        if stop_requested:
             break
 
     return _write_run_summary(results, start_time, log_file, summary_title)
+
+
+def _run_file_batch_mode(test_names, start_index, args, log_file, mode, count_msg, summary_title):
+    """
+    Run discovered pytest node ids grouped by file. Known oversized files are
+    automatically sharded to avoid one very large pytest subprocess.
+    """
+    return _run_grouped_file_batch_mode(
+        test_names, start_index, args, log_file, mode, count_msg, summary_title,
+        shard_all=False, shard_default_files=True,
+    )
+
+
+def _run_shard_batch_mode(test_names, start_index, args, log_file, mode, count_msg, summary_title):
+    """Run discovered pytest node ids in fixed-size shards within each file."""
+    return _run_grouped_file_batch_mode(
+        test_names, start_index, args, log_file, mode, count_msg, summary_title,
+        shard_all=True, shard_default_files=False,
+    )
+
+
+def _run_full_suite_batch(test_names, start_index, args, log_file, mode, count_prefix):
+    """Dispatch full-suite execution to the selected batch mode."""
+    if args.batch_mode == BATCH_MODE_FILE:
+        count_msg = (
+            f"{count_prefix} Running in file batches. "
+            f"Per-file timeout: {args.per_file_timeout}s"
+        )
+        return _run_file_batch_mode(
+            test_names, start_index, args, log_file, mode,
+            count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
+        )
+    if args.batch_mode == BATCH_MODE_SHARD:
+        count_msg = (
+            f"{count_prefix} Running in shards of up to {args.shard_size} test(s). "
+            f"Per-file timeout: {args.per_file_timeout}s"
+        )
+        return _run_shard_batch_mode(
+            test_names, start_index, args, log_file, mode,
+            count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
+        )
+
+    count_msg = f"{count_prefix} Per-test timeout: {args.per_test_timeout}s"
+    return _run_test_batch(
+        test_names, start_index, args, log_file, mode, by_id=True,
+        count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
+    )
 
 
 def main():
@@ -1190,20 +1379,27 @@ def main():
         type=int,
         default=None,
         metavar='SECONDS',
-        help='Per-test pytest-timeout value in seconds (default: 300)'
+        help='Per-test pytest-timeout value in seconds for --batch-mode test, CSV, and rerun modes (default: 1200)'
     )
     parser.add_argument(
         '--batch-mode',
-        choices=[BATCH_MODE_FILE, BATCH_MODE_TEST],
+        choices=[BATCH_MODE_FILE, BATCH_MODE_SHARD, BATCH_MODE_TEST],
         default=BATCH_MODE_FILE,
-        help='Full-suite execution granularity: file batches by default, or one subprocess per pytest node with test'
+        help='Full-suite execution granularity: file batches by default, fixed-size shards, or one subprocess per pytest node with test'
     )
     parser.add_argument(
         '--per-file-timeout',
         type=int,
         default=DEFAULT_PER_FILE_TIMEOUT_SECONDS,
         metavar='SECONDS',
-        help='Per-file subprocess timeout in seconds for --batch-mode file (default: 600)'
+        help='Per-file subprocess timeout in seconds for --batch-mode file/shard (default: 43200)'
+    )
+    parser.add_argument(
+        '--shard-size',
+        type=int,
+        default=DEFAULT_SHARD_SIZE,
+        metavar='N',
+        help='Number of pytest node ids per shard for --batch-mode shard and default opinfo sharding (default: 100)'
     )
     parser.add_argument(
         '--resume',
@@ -1291,6 +1487,9 @@ def main():
         print("Warning: --regex only applies to full-suite mode (--all-tests); ignoring --regex.\n")
     if args.per_test_timeout is None:
         args.per_test_timeout = DEFAULT_PER_TEST_TIMEOUT_SECONDS
+    if args.shard_size <= 0:
+        print("Error: --shard-size must be a positive integer")
+        sys.exit(1)
 
     # Inductor ROCm tests require ROCM_HOME to be set in the user environment.
     try:
@@ -1408,24 +1607,10 @@ def main():
                             test_names, args.log_file, args.resume, args.no_checkpoint, log_file,
                             "not in discovered list"
                         )
-                        if args.batch_mode == BATCH_MODE_FILE:
-                            count_msg = (
-                                f"Running {len(test_names)} test(s) (filtered) in file batches. "
-                                f"Per-file timeout: {args.per_file_timeout}s"
-                            )
-                            exit_code = _run_file_batch_mode(
-                                test_names, start_index, args, log_file, mode,
-                                count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
-                            )
-                        else:
-                            count_msg = (
-                                f"Running {len(test_names)} test(s) (filtered). "
-                                f"Per-test timeout: {args.per_test_timeout}s"
-                            )
-                            exit_code = _run_test_batch(
-                                test_names, start_index, args, log_file, mode, by_id=True,
-                                count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
-                            )
+                        exit_code = _run_full_suite_batch(
+                            test_names, start_index, args, log_file, mode,
+                            count_prefix=f"Running {len(test_names)} test(s) (filtered)."
+                        )
                 else:
                     if args.collect_only:
                         _do_collect_only_and_exit(args.pytorch_path, test_names, by_id=True)
@@ -1434,21 +1619,10 @@ def main():
                         test_names, args.log_file, args.resume, args.no_checkpoint, log_file,
                         "not in discovered list"
                     )
-                    if args.batch_mode == BATCH_MODE_FILE:
-                        count_msg = (
-                            f"Found {len(test_names)} test(s). Running in file batches. "
-                            f"Per-file timeout: {args.per_file_timeout}s"
-                        )
-                        exit_code = _run_file_batch_mode(
-                            test_names, start_index, args, log_file, mode,
-                            count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
-                        )
-                    else:
-                        count_msg = f"Found {len(test_names)} test(s). Per-test timeout: {args.per_test_timeout}s"
-                        exit_code = _run_test_batch(
-                            test_names, start_index, args, log_file, mode, by_id=True,
-                            count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
-                        )
+                    exit_code = _run_full_suite_batch(
+                        test_names, start_index, args, log_file, mode,
+                        count_prefix=f"Found {len(test_names)} test(s)."
+                    )
         else:
             # CSV mode: read test names and run each one (pytest -k, same as full-suite for execution)
             ensure_pytest_and_timeout_installed()
