@@ -27,6 +27,8 @@ TRITON_NIGHTLY_INDUCTOR_FILES = [
     'inductor/test_torchinductor_opinfo.py',
 ]
 
+_TORCH_VERSION_CACHE = None
+
 
 def _require_rocm_home():
     """
@@ -42,6 +44,40 @@ def _require_rocm_home():
     return rocm_home
 
 
+def _installed_torch_version():
+    """
+    Return installed torch.__version__ without importing torch from the caller cwd.
+    Importing torch from a PyTorch checkout root can pick up the source tree instead
+    of the installed extension, so query from /tmp in a subprocess.
+    """
+    global _TORCH_VERSION_CACHE
+    if _TORCH_VERSION_CACHE is not None:
+        return _TORCH_VERSION_CACHE
+
+    result = subprocess.run(
+        [sys.executable, '-c', 'import torch; print(torch.__version__)'],
+        cwd='/tmp',
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if result.returncode != 0:
+        _TORCH_VERSION_CACHE = ''
+    else:
+        lines = (result.stdout or '').strip().splitlines()
+        _TORCH_VERSION_CACHE = lines[-1] if lines else ''
+    return _TORCH_VERSION_CACHE
+
+
+def _torch_version_is_before_2_13():
+    version = _installed_torch_version()
+    match = re.match(r'^(\d+)\.(\d+)', version)
+    if not match:
+        return False
+    major, minor = (int(match.group(1)), int(match.group(2)))
+    return (major, minor) < (2, 13)
+
+
 def _build_test_env():
     """Build subprocess environment for inductor tests."""
     env = {
@@ -52,6 +88,8 @@ def _build_test_env():
         'PYTORCH_TESTING_DEVICE_ONLY_FOR': 'cuda',
     }
     env['ROCM_HOME'] = _require_rocm_home()
+    if _torch_version_is_before_2_13():
+        env['TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER'] = '0'
     return env
 
 
