@@ -91,6 +91,44 @@ Full-suite mode starts from a list of files under `PYTORCH_PATH/test/`.
 
 Batch modes apply only to full-suite mode (`--all-tests`). CSV mode and rerun-failed mode use per-test subprocess execution.
 
+## Suite-Level GPU Concurrency
+
+Use `--num-gpus N` to run full-suite test files concurrently across GPUs. This is suite/file-level concurrency: each discovered test file is assigned to one worker on one GPU, and tests from that file are not spread across multiple GPUs.
+
+`--num-gpus > 1` is initially supported only with full-suite mode (`--all-tests`, including the full-suite shortcuts, `-i`, and `--regex`). CSV mode and rerun-failed mode reject `--num-gpus > 1`.
+
+`--num-gpus` is orthogonal to `--batch-mode`:
+
+- `--batch-mode file --num-gpus 4` runs up to four test files at once, each in file mode.
+- `--batch-mode shard --num-gpus 4` runs up to four test files at once, each internally sharded on one GPU.
+- `--batch-mode test --num-gpus 4` runs up to four test files at once, each using one-test-at-a-time execution on one GPU.
+
+```mermaid
+flowchart TD
+    discover["Discover pytest node IDs"] --> groupByFile["Group nodes by test file"]
+    groupByFile --> queue["Suite work queue"]
+    queue --> gpu0["Worker GPU0"]
+    queue --> gpu1["Worker GPU1"]
+    queue --> gpuN["Worker GPUN"]
+    gpu0 --> log0["worker0 log"]
+    gpu1 --> log1["worker1 log"]
+    gpuN --> logN["workerN log"]
+    log0 --> manifest["manifest JSON"]
+    log1 --> manifest
+    logN --> manifest
+```
+
+Concurrent runs avoid interleaved logs:
+
+- The top-level `--log-file` path is the parent log.
+- Worker logs are written next to it as `<log>.worker0`, `<log>.worker1`, and so on.
+- The parent writes a manifest at `<log>.manifest.json`.
+- Worker checkpoints are written next to worker logs.
+- The parent log and manifest record full wall-clock start, end, and elapsed time for the whole concurrent run.
+- Each worker log and manifest worker entry record per-worker start, end, and elapsed time.
+
+`analyze_inductor_run.py` detects the manifest from the metadata file or parent log, parses all worker logs, deduplicates by test node ID, and reports one aggregate suite summary.
+
 ### File mode: `--batch-mode file`
 
 File mode is the default. It runs one pytest subprocess per test file:
@@ -243,6 +281,7 @@ Each test is classified into exactly one state:
 | `--log-file PATH` | All modes except `--collect-only` | Path for the run log. |
 | `--stop-on-failure` | All execution modes | Stop after first failing test or fallback failure. |
 | `--batch-mode {file,shard,test}` | Full-suite mode only | Full-suite execution granularity. Default: `file`. |
+| `--num-gpus N` | Full-suite mode only | Run up to N test suites concurrently, one worker per GPU. Default: 1. |
 | `--per-file-timeout SECONDS` | Full-suite `file`/`shard` batch modes | Outer timeout for file or shard subprocesses. Default: 43200. |
 | `--shard-size N` | Full-suite `shard` mode and automatic opinfo sharding | Number of pytest node IDs per shard. Default: 100. |
 | `--per-test-timeout SECONDS` | All execution modes | Pytest-timeout per-test timeout. Default: 1200. |
@@ -263,6 +302,12 @@ python run_tests.py --all-tests --pytorch-path /path/to/pytorch
 
 # Run full suite in 100-test shards
 python run_tests.py --all-tests --batch-mode shard --shard-size 100 --pytorch-path /path/to/pytorch
+
+# Run the PyTorch CI inductor_core file set with suite-level concurrency on 4 GPUs
+python run_tests.py --include-inductor-all-tests --num-gpus 4 --pytorch-path /path/to/pytorch
+
+# Run two explicit suites concurrently, with each suite internally using shard mode
+python run_tests.py --all-tests -i inductor/test_aot_inductor.py inductor/test_torchinductor_opinfo.py --batch-mode shard --num-gpus 2 --pytorch-path /path/to/pytorch
 
 # Run full suite with historical per-test-node subprocess behavior
 python run_tests.py --all-tests --batch-mode test --pytorch-path /path/to/pytorch

@@ -152,6 +152,61 @@ def parse_log(log_path: Path) -> tuple[list[dict[str, object]], dict[str, int]]:
     return unnamed_results + list(latest_by_name.values()), final_summary
 
 
+def manifest_path_from_log(log_path: Path) -> Path | None:
+    """Find a concurrent manifest path in a parent log, if present."""
+    try:
+        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("Concurrent manifest:"):
+                value = line.split(":", 1)[1].strip()
+                if value:
+                    return Path(value)
+    except OSError:
+        return None
+    return None
+
+
+def resolve_manifest_path(meta: dict[str, str], log_path: Path) -> Path | None:
+    """Return the concurrent manifest path from metadata or parent log."""
+    if meta.get("MANIFEST"):
+        return Path(meta["MANIFEST"])
+    return manifest_path_from_log(log_path)
+
+
+def parse_manifest_results(manifest_path: Path) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Parse and combine all worker logs from a concurrent run manifest."""
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    counts = manifest.get("counts", {})
+    combined: list[dict[str, object]] = []
+    final_summary: dict[str, object] = {
+        "manifest": str(manifest_path),
+        "Total tests run": counts.get("total", manifest.get("total_tests", 0)),
+        "Passed": counts.get("passed", 0),
+        "Skipped": counts.get("skipped", 0),
+        "Xfailed": counts.get("xfailed", 0),
+        "Error": counts.get("error", 0),
+        "Failed": counts.get("failed", 0),
+        "Timed out": counts.get("timedout", 0),
+        "Missed": counts.get("missed", 0),
+    }
+    for worker in manifest.get("workers", []):
+        worker_log = Path(worker["log"])
+        worker_results, worker_summary = parse_log(worker_log)
+        combined.extend(worker_results)
+
+    latest_by_name: collections.OrderedDict[str, dict[str, object]] = collections.OrderedDict()
+    unnamed_results: list[dict[str, object]] = []
+    for result in combined:
+        name = result.get("name")
+        if not name:
+            unnamed_results.append(result)
+            continue
+        name_str = str(name)
+        if name_str in latest_by_name:
+            del latest_by_name[name_str]
+        latest_by_name[name_str] = result
+    return unnamed_results + list(latest_by_name.values()), final_summary
+
+
 def load_checkpoint(path: Path) -> dict[str, object] | None:
     if not path.exists():
         return None
@@ -248,12 +303,28 @@ def main() -> None:
     output_path = Path(args.output) if args.output else log_path.with_name("inductor_core_running_analysis.md")
     pytorch_root = log_path.parent
 
-    results, final_summary = parse_log(log_path)
-    checkpoint = load_checkpoint(checkpoint_path)
+    manifest_path = resolve_manifest_path(meta, log_path)
+    if manifest_path and manifest_path.exists():
+        results, final_summary = parse_manifest_results(manifest_path)
+        checkpoint = None
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        worker_checkpoints = {
+            str(worker.get("worker_id")): load_checkpoint(Path(worker["checkpoint"]))
+            for worker in manifest.get("workers", [])
+            if worker.get("checkpoint")
+        }
+    else:
+        results, final_summary = parse_log(log_path)
+        checkpoint = load_checkpoint(checkpoint_path)
+        manifest = None
+        worker_checkpoints = {}
 
     completed = 0
     total = 0
-    if checkpoint:
+    if manifest:
+        total = int(manifest.get("total_tests") or 0)
+        completed = len({str(r.get("name")) for r in results if r.get("name")})
+    elif checkpoint:
         last_index = checkpoint.get("last_index")
         total = int(checkpoint.get("total") or 0)
         if isinstance(last_index, int):
@@ -307,6 +378,37 @@ def main() -> None:
     lines.append(f"- GPU model: `{gpu_name}`")
     lines.append(f"- Test log: `{log_path}`")
     lines.append(f"- Checkpoint: `{checkpoint_path}`\n")
+
+    if manifest:
+        lines.append("## Concurrent Run\n")
+        lines.append(f"- Manifest: `{manifest_path}`")
+        lines.append(f"- Concurrent workers: `{manifest.get('num_workers')}`")
+        lines.append(f"- Num GPUs requested: `{manifest.get('num_gpus')}`")
+        lines.append(f"- Batch mode: `{manifest.get('batch_mode')}`")
+        if manifest.get("start_time"):
+            lines.append(f"- Start time: `{manifest.get('start_time')}`")
+        if manifest.get("end_time"):
+            lines.append(f"- End time: `{manifest.get('end_time')}`")
+        if manifest.get("elapsed_seconds") is not None:
+            lines.append(f"- Total elapsed seconds: `{manifest.get('elapsed_seconds')}`")
+        lines.append("- Workers:")
+        for worker in manifest.get("workers", []):
+            worker_id = str(worker.get("worker_id"))
+            checkpoint_data = worker_checkpoints.get(worker_id)
+            worker_bits = [
+                f"worker `{worker.get('worker_id')}`",
+                f"GPU `{worker.get('gpu_id')}`",
+                f"tests `{worker.get('total_tests')}`",
+                f"log `{worker.get('log')}`",
+            ]
+            if worker.get("elapsed_seconds") is not None:
+                worker_bits.append(f"elapsed `{worker.get('elapsed_seconds')}s`")
+            if worker.get("exit_code") is not None:
+                worker_bits.append(f"exit `{worker.get('exit_code')}`")
+            if checkpoint_data and checkpoint_data.get("next_test"):
+                worker_bits.append(f"next `{checkpoint_data.get('next_test')}`")
+            lines.append(f"  - {', '.join(worker_bits)}")
+        lines.append("")
 
     lines.append("## Overall Progress\n")
     lines.append(f"- Completed: `{completed} / {total}` (`{pct:.2f}%`)")

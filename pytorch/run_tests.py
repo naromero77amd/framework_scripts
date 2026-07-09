@@ -6,13 +6,17 @@ Script to run PyTorch inductor unit tests from a CSV file.
 import csv
 import io
 import json
+import multiprocessing
+import os
 import re
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
 # Relative path to the test file (under PyTorch root); used in run_test, discover_tests, main
@@ -146,6 +150,11 @@ BATCH_MODE_SHARD = "shard"
 BATCH_MODE_TEST = "test"
 DEFAULT_SHARDED_FILE_SUFFIXES = ("test/inductor/test_torchinductor_opinfo.py",)
 UNKNOWN_TIMEOUT_MISS_LIMIT = 4
+
+
+def _now_iso():
+    """Return a local timestamp for logs and manifests."""
+    return datetime.now().astimezone().isoformat(timespec='seconds')
 
 
 def _is_success_state(state: str) -> bool:
@@ -1330,8 +1339,328 @@ def _run_shard_batch_mode(test_names, start_index, args, log_file, mode, count_m
     )
 
 
+def _result_state_counts(results):
+    """Return summary counts for result dictionaries."""
+    return {
+        'total': len(results),
+        STATE_PASSED: sum(1 for r in results if r.get('state') == STATE_PASSED),
+        STATE_SKIPPED: sum(1 for r in results if r.get('state') == STATE_SKIPPED),
+        STATE_XFAILED: sum(1 for r in results if r.get('state') == STATE_XFAILED),
+        STATE_ERROR: sum(1 for r in results if r.get('state') == STATE_ERROR),
+        STATE_FAILED: sum(1 for r in results if r.get('state') == STATE_FAILED),
+        STATE_TIMEDOUT: sum(1 for r in results if r.get('state') == STATE_TIMEDOUT),
+        STATE_MISSED: sum(1 for r in results if r.get('state') == STATE_MISSED),
+    }
+
+
+def _counts_have_bad_results(counts):
+    return (
+        counts.get(STATE_ERROR, 0) > 0
+        or counts.get(STATE_FAILED, 0) > 0
+        or counts.get(STATE_TIMEDOUT, 0) > 0
+        or counts.get(STATE_MISSED, 0) > 0
+    )
+
+
+def _manifest_path_for_log(log_file_path):
+    return str(Path(log_file_path).with_suffix(Path(log_file_path).suffix + '.manifest.json'))
+
+
+def _worker_log_path(log_file_path, worker_id):
+    return str(Path(log_file_path).with_suffix(Path(log_file_path).suffix + f'.worker{worker_id}'))
+
+
+def _write_manifest(path, manifest):
+    try:
+        Path(path).write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+    except OSError:
+        pass
+
+
+def _assign_suite_groups_to_workers(groups, num_workers):
+    """Greedily assign suite/file groups to workers by discovered node count."""
+    assignments = [
+        {'worker_id': worker_id, 'groups': [], 'total_tests': 0}
+        for worker_id in range(num_workers)
+    ]
+    for file_name, node_ids in sorted(groups, key=lambda item: len(item[1]), reverse=True):
+        target = min(assignments, key=lambda item: item['total_tests'])
+        target['groups'].append((file_name, node_ids))
+        target['total_tests'] += len(node_ids)
+    return assignments
+
+
+def _run_worker_assigned_suites(assigned_groups, args, log_file, mode, worker_test_names):
+    """Run one worker's assigned suites and write a single worker summary."""
+    results = []
+    start_time = time.time()
+    node_index = 0
+    stop_requested = False
+
+    for file_name, node_ids in assigned_groups:
+        if args.batch_mode == BATCH_MODE_TEST:
+            for node_id in node_ids:
+                result = _run_one_test_with_progress(
+                    node_id, node_index + 1, len(worker_test_names),
+                    args, log_file, by_id=True,
+                    timeout=args.per_test_timeout or DEFAULT_PER_TEST_TIMEOUT_SECONDS,
+                )
+                results.append(result)
+                node_index += 1
+                if not args.no_checkpoint:
+                    next_test = worker_test_names[node_index] if node_index < len(worker_test_names) else None
+                    write_checkpoint(
+                        args.log_file, node_id, next_test, node_index - 1, len(worker_test_names), mode,
+                        csv_file=args.csv_file, pytorch_path=args.pytorch_path,
+                    )
+                if not result['success'] and args.stop_on_failure:
+                    stop_msg = f"\nStopping due to test failure: {node_id}\n"
+                    print(stop_msg, end='')
+                    log_file.write(stop_msg)
+                    log_file.flush()
+                    stop_requested = True
+                    break
+        else:
+            should_shard = (
+                args.batch_mode == BATCH_MODE_SHARD
+                or (args.batch_mode == BATCH_MODE_FILE and _is_default_sharded_file(file_name))
+            )
+            chunks = _chunk_node_ids(node_ids, args.shard_size) if should_shard else [node_ids]
+            if should_shard:
+                msg = (
+                    f"Running {file_name} in {len(chunks)} shard(s) "
+                    f"of up to {args.shard_size} test(s).\n"
+                )
+                print(msg, end='')
+                log_file.write(msg)
+                log_file.flush()
+            for shard_index, chunk in enumerate(chunks, start=1):
+                if should_shard:
+                    msg = (
+                        f"Shard {shard_index}/{len(chunks)} for {file_name}: "
+                        f"{len(chunk)} test(s)\n"
+                    )
+                    print(msg, end='')
+                    log_file.write(msg)
+                    log_file.flush()
+                node_index, stop_requested = _run_file_node_group(
+                    file_name, chunk, args, log_file, mode, worker_test_names, node_index, results
+                )
+                if stop_requested:
+                    break
+        if stop_requested:
+            break
+
+    exit_code = _write_run_summary(
+        results, start_time, log_file,
+        f"TEST SUMMARY (worker {getattr(args, 'worker_id', '?')})",
+    )
+    return exit_code, _result_state_counts(results)
+
+
+def _concurrent_worker_main(worker_spec, args_dict, result_queue):
+    """Worker process entry point for suite-level GPU concurrency."""
+    worker_id = worker_spec['worker_id']
+    gpu_id = str(worker_spec['gpu_id'])
+    worker_log_path = worker_spec['log']
+    assigned_groups = [
+        (item['file_name'], item['node_ids'])
+        for item in worker_spec['suites']
+    ]
+    worker_test_names = [
+        node_id
+        for _, node_ids in assigned_groups
+        for node_id in node_ids
+    ]
+
+    subprocess.os.environ['HIP_VISIBLE_DEVICES'] = gpu_id
+    subprocess.os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
+
+    args = SimpleNamespace(**args_dict)
+    args.log_file = worker_log_path
+    args.worker_id = worker_id
+
+    stdout_devnull = open(os.devnull, 'w', encoding='utf-8')
+    original_stdout = sys.stdout
+    sys.stdout = stdout_devnull
+    start_epoch = time.time()
+    start_time = _now_iso()
+    exit_code = 1
+    counts = _result_state_counts([])
+    error = None
+
+    try:
+        with open(worker_log_path, 'w', encoding='utf-8') as log_file:
+            log_file.write(f"Worker: {worker_id}\n")
+            log_file.write(f"GPU: {gpu_id}\n")
+            log_file.write(f"Mode: full_suite\n")
+            log_file.write(f"Batch mode: {args.batch_mode}\n")
+            log_file.write(f"Worker start: {start_time}\n")
+            log_file.write(f"Assigned suites: {len(assigned_groups)}\n")
+            log_file.write(f"Assigned tests: {len(worker_test_names)}\n\n")
+            log_file.flush()
+            exit_code, counts = _run_worker_assigned_suites(
+                assigned_groups, args, log_file, 'full_suite', worker_test_names
+            )
+            end_epoch = time.time()
+            log_file.write(f"Worker end: {_now_iso()}\n")
+            log_file.write(f"Worker elapsed seconds: {end_epoch - start_epoch:.2f}\n")
+            log_file.flush()
+    except Exception:
+        error = traceback.format_exc()
+        end_epoch = time.time()
+        try:
+            with open(worker_log_path, 'a', encoding='utf-8') as log_file:
+                log_file.write("\nWorker error:\n")
+                log_file.write(error)
+                log_file.write("\n")
+        except OSError:
+            pass
+    finally:
+        sys.stdout = original_stdout
+        stdout_devnull.close()
+
+    if error:
+        exit_code = 1
+    end_time = _now_iso()
+    result_queue.put({
+        'worker_id': worker_id,
+        'gpu_id': gpu_id,
+        'log': worker_log_path,
+        'checkpoint': checkpoint_path(worker_log_path),
+        'start_time': start_time,
+        'end_time': end_time,
+        'elapsed_seconds': round(end_epoch - start_epoch, 2),
+        'exit_code': exit_code,
+        'counts': counts,
+        'error': error,
+    })
+
+
+def _run_concurrent_full_suite_batch(test_names, args, log_file, mode, count_prefix):
+    """Run full-suite file groups concurrently across GPUs."""
+    groups = _group_node_ids_by_file(test_names)
+    num_workers = min(args.num_gpus, len(groups))
+    assignments = _assign_suite_groups_to_workers(groups, num_workers)
+    manifest_path = _manifest_path_for_log(args.log_file)
+    start_epoch = time.time()
+    start_time = _now_iso()
+
+    worker_specs = []
+    for assignment in assignments:
+        worker_id = assignment['worker_id']
+        worker_log = _worker_log_path(args.log_file, worker_id)
+        worker_specs.append({
+            'worker_id': worker_id,
+            'gpu_id': worker_id,
+            'log': worker_log,
+            'checkpoint': checkpoint_path(worker_log),
+            'total_tests': assignment['total_tests'],
+            'suites': [
+                {
+                    'file_name': file_name,
+                    'test_count': len(node_ids),
+                    'node_ids': node_ids,
+                }
+                for file_name, node_ids in assignment['groups']
+            ],
+        })
+
+    manifest = {
+        'mode': mode,
+        'batch_mode': args.batch_mode,
+        'num_gpus': args.num_gpus,
+        'num_workers': num_workers,
+        'total_tests': len(test_names),
+        'parent_log': args.log_file,
+        'manifest': manifest_path,
+        'start_time': start_time,
+        'workers': worker_specs,
+    }
+    _write_manifest(manifest_path, manifest)
+
+    msg = (
+        f"{count_prefix} Running with suite-level GPU concurrency. "
+        f"Workers: {num_workers}, GPUs: 0-{num_workers - 1}. "
+        f"Manifest: {manifest_path}\n\n"
+    )
+    print(msg, end='')
+    log_file.write(msg)
+    log_file.write("Mode: full_suite\n")
+    log_file.write(f"Batch mode: {args.batch_mode}\n")
+    log_file.write(f"Num GPUs: {args.num_gpus}\n")
+    log_file.write(f"Concurrent manifest: {manifest_path}\n")
+    log_file.write(f"Concurrent start: {start_time}\n")
+    log_file.flush()
+
+    result_queue = multiprocessing.Queue()
+    args_dict = vars(args).copy()
+    processes = []
+    for worker_spec in worker_specs:
+        process = multiprocessing.Process(
+            target=_concurrent_worker_main,
+            args=(worker_spec, args_dict, result_queue),
+        )
+        process.start()
+        processes.append(process)
+
+    worker_results = []
+    for _ in processes:
+        worker_results.append(result_queue.get())
+    for process in processes:
+        process.join()
+
+    end_epoch = time.time()
+    end_time = _now_iso()
+    aggregate_counts = _result_state_counts([])
+    for result in worker_results:
+        counts = result.get('counts') or {}
+        aggregate_counts['total'] += counts.get('total', 0)
+        for state in [
+            STATE_PASSED, STATE_SKIPPED, STATE_XFAILED, STATE_ERROR,
+            STATE_FAILED, STATE_TIMEDOUT, STATE_MISSED,
+        ]:
+            aggregate_counts[state] += counts.get(state, 0)
+        for worker in manifest['workers']:
+            if worker['worker_id'] == result['worker_id']:
+                worker.update(result)
+                break
+
+    manifest['end_time'] = end_time
+    manifest['elapsed_seconds'] = round(end_epoch - start_epoch, 2)
+    manifest['counts'] = aggregate_counts
+    manifest['exit_code'] = 1 if _counts_have_bad_results(aggregate_counts) else 0
+    _write_manifest(manifest_path, manifest)
+
+    summary = f"\n{'='*70}\nTEST SUMMARY (full suite concurrent)\n{'='*70}\n"
+    summary += f"Total tests run: {aggregate_counts['total']}\n"
+    summary += f"Passed: {aggregate_counts[STATE_PASSED]}\n"
+    summary += f"Skipped: {aggregate_counts[STATE_SKIPPED]}\n"
+    summary += f"Xfailed: {aggregate_counts[STATE_XFAILED]}\n"
+    summary += f"Error: {aggregate_counts[STATE_ERROR]}\n"
+    summary += f"Failed: {aggregate_counts[STATE_FAILED]}\n"
+    summary += f"Timed out: {aggregate_counts[STATE_TIMEDOUT]}\n"
+    summary += f"Missed: {aggregate_counts[STATE_MISSED]}\n"
+    summary += f"Total time: {end_epoch - start_epoch:.2f}s\n"
+    summary += f"Concurrent manifest: {manifest_path}\n"
+    summary += f"{'='*70}\n\n"
+    print(summary, end='')
+    log_file.write(summary)
+    log_file.flush()
+    return manifest['exit_code']
+
+
 def _run_full_suite_batch(test_names, start_index, args, log_file, mode, count_prefix):
     """Dispatch full-suite execution to the selected batch mode."""
+    if args.num_gpus > 1:
+        if start_index != 0:
+            msg = "--num-gpus does not support resume/start offsets yet. Start a fresh full-suite run.\n"
+            print(msg, end='')
+            log_file.write(msg)
+            log_file.flush()
+            return 1
+        return _run_concurrent_full_suite_batch(test_names, args, log_file, mode, count_prefix)
+
     if args.batch_mode == BATCH_MODE_FILE:
         count_msg = (
             f"{count_prefix} Running in file batches. "
@@ -1441,6 +1770,13 @@ def main():
         help='Number of pytest node ids per shard for --batch-mode shard and default opinfo sharding (default: 100)'
     )
     parser.add_argument(
+        '--num-gpus',
+        type=int,
+        default=1,
+        metavar='N',
+        help='Full-suite only: run up to N test suites concurrently, one worker per GPU (default: 1)'
+    )
+    parser.add_argument(
         '--resume',
         action='store_true',
         help='Resume from the next test after the last run (uses checkpoint for this log file)'
@@ -1528,6 +1864,15 @@ def main():
         args.per_test_timeout = DEFAULT_PER_TEST_TIMEOUT_SECONDS
     if args.shard_size <= 0:
         print("Error: --shard-size must be a positive integer")
+        sys.exit(1)
+    if args.num_gpus <= 0:
+        print("Error: --num-gpus must be a positive integer")
+        sys.exit(1)
+    if args.num_gpus > 1 and not args.all_tests:
+        print("Error: --num-gpus > 1 is only supported with full-suite mode (--all-tests)")
+        sys.exit(1)
+    if args.num_gpus > 1 and args.resume:
+        print("Error: --resume is not supported with --num-gpus > 1 yet. Start a fresh full-suite run.")
         sys.exit(1)
 
     # Inductor ROCm tests require ROCM_HOME to be set in the user environment.
