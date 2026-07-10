@@ -12,7 +12,7 @@ Full-suite mode defaults to `test/inductor/test_torchinductor.py` and runs one p
 
 - **PyTorch path**: Pass the PyTorch checkout root with `--pytorch-path`.
 - The script sets `PYTORCH_TEST_WITH_ROCM=1`, `HSA_FORCE_FINE_GRAIN_PCIE=1`, and `PYTORCH_TESTING_DEVICE_ONLY_FOR=cuda` when invoking tests.
-- **pytest, pytest-timeout, and expecttest**: The script checks these imports and aborts with a clear message if any are missing. Install with `pip install pytest pytest-timeout expecttest`.
+- **pytest, pytest-timeout, pytest-rerunfailures, and expecttest**: The script checks these imports and aborts with a clear message if any are missing. Install with `pip install pytest pytest-timeout pytest-rerunfailures expecttest`.
 - Timeout behavior depends on execution strategy:
   - `--per-test-timeout` is passed to pytest-timeout and is a per-test timeout.
   - Full-suite `--batch-mode file` and `--batch-mode shard` also use `--per-file-timeout` as an outer safety timeout for each pytest subprocess.
@@ -90,6 +90,12 @@ Full-suite mode starts from a list of files under `PYTORCH_PATH/test/`.
 ## Full-Suite Execution Strategy
 
 Batch modes apply only to full-suite mode (`--all-tests`). CSV mode and rerun-failed mode use per-test subprocess execution.
+
+## Reruns And Failure Reporting
+
+By default, failed single-test executions are retried up to two times, matching PyTorch's normal rerun count. Use `--reruns 0` to disable retries entirely.
+
+Recovered tests are reported separately as flaky, while tests that still fail after all attempts are reported as consistent failures. Signal-based exits, such as `SIGKILL` or `SIGSEGV`, are categorized as failed tests and include the signal name in the per-test log and final summary.
 
 ## Suite-Level GPU Concurrency
 
@@ -280,6 +286,7 @@ Each test is classified into exactly one state:
 | `--pytorch-path PATH` | All modes | Path to the PyTorch checkout. |
 | `--log-file PATH` | All modes except `--collect-only` | Path for the run log. |
 | `--stop-on-failure` | All execution modes | Stop after first failing test or fallback failure. |
+| `--reruns N` | All execution modes | Number of times to rerun a failed test before recording final failure. Default: 2; use 0 for no reruns. |
 | `--batch-mode {file,shard,test}` | Full-suite mode only | Full-suite execution granularity. Default: `file`. |
 | `--num-gpus N` | Full-suite mode only | Run up to N test suites concurrently, one worker per GPU. Default: 1. |
 | `--per-file-timeout SECONDS` | Full-suite `file`/`shard` batch modes | Outer timeout for file or shard subprocesses. Default: 43200. |
@@ -323,6 +330,9 @@ python run_tests.py --include-inductor-all-tests --pytorch-path /path/to/pytorch
 
 # Run the ROCm torch-triton-nightly Inductor validation subset
 python run_tests.py --include-triton-nightly-inductor-tests --pytorch-path /path/to/pytorch
+
+# Run the ROCm torch-triton-nightly Inductor validation subset across 8 GPUs
+python run_tests.py --include-triton-nightly-inductor-tests --num-gpus 8 --pytorch-path /path/to/pytorch
 
 # Resume a previous full-suite run
 python run_tests.py --all-tests --pytorch-path /path/to/pytorch --log-file full_run.log --resume
