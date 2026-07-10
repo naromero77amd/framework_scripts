@@ -9,6 +9,7 @@ import json
 import multiprocessing
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -99,19 +100,19 @@ def _build_test_env():
 
 def ensure_pytest_and_timeout_installed():
     """
-    Verify that pytest, pytest-timeout, and expecttest are installed (same interpreter as this script).
+    Verify that pytest, pytest-timeout, pytest-rerunfailures, and expecttest are installed (same interpreter as this script).
     Abort with a clear message if any are missing. Call before using pytest for discovery or execution.
     """
     result = subprocess.run(
-        [sys.executable, '-c', 'import pytest; import pytest_timeout; import expecttest'],
+        [sys.executable, '-c', 'import pytest; import pytest_timeout; import pytest_rerunfailures; import expecttest'],
         capture_output=True,
         text=True,
         timeout=10,
     )
     if result.returncode != 0:
         err = (result.stderr or result.stdout or '').strip()
-        print("Error: This script requires pytest, pytest-timeout, and expecttest.")
-        print("Install them with:  pip install pytest pytest-timeout expecttest")
+        print("Error: This script requires pytest, pytest-timeout, pytest-rerunfailures, and expecttest.")
+        print("Install them with:  pip install pytest pytest-timeout pytest-rerunfailures expecttest")
         if err:
             print(f"Details: {err}")
         sys.exit(1)
@@ -162,6 +163,17 @@ def _is_success_state(state: str) -> bool:
     return state in (STATE_PASSED, STATE_SKIPPED, STATE_XFAILED)
 
 
+def _signal_name_from_returncode(returncode):
+    """Return a signal name for negative subprocess return codes."""
+    if returncode is None or returncode >= 0:
+        return None
+    signal_number = -returncode
+    try:
+        return signal.Signals(signal_number).name
+    except ValueError:
+        return f"signal {signal_number}"
+
+
 def _output_indicates_xfailed(stdout: str, stderr: str) -> bool:
     """True if pytest output indicates an expected failure."""
     combined = (stdout or "") + "\n" + (stderr or "")
@@ -201,7 +213,7 @@ def _output_indicates_timeout(stdout: str, stderr: str) -> bool:
     return "TimeoutExpired" in combined or "Timeout" in combined
 
 
-def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
+def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False, attempt=None, total_attempts=None):
     """
     Run a single test with the specified test name.
 
@@ -215,7 +227,7 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         by_id: If True, test_name is a full pytest node id; run pytest <node_id> from pytorch_path.
 
     Returns:
-        tuple: (success: bool, elapsed_time: float, timed_out: bool, state: str)
+        dict with success, elapsed_time, timed_out, state, returncode, and signal_name.
         state is one of STATE_PASSED, STATE_SKIPPED, STATE_XFAILED, STATE_ERROR,
         STATE_FAILED, STATE_TIMEDOUT.
     """
@@ -230,7 +242,10 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
 
     env = _build_test_env()
     
-    header = f"\n{'='*70}\nRunning: {test_name}\n{'='*70}\n"
+    attempt_suffix = ""
+    if attempt is not None and total_attempts is not None:
+        attempt_suffix = f"\nAttempt: {attempt}/{total_attempts}"
+    header = f"\n{'='*70}\nRunning: {test_name}{attempt_suffix}\n{'='*70}\n"
     print(header, end='')
     log_file.write(header)
     log_file.flush()
@@ -253,8 +268,11 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         stdout_str = result.stdout or ""
         stderr_str = result.stderr or ""
         timed_out = False
+        signal_name = _signal_name_from_returncode(result.returncode)
 
-        if _output_indicates_xpassed(stdout_str, stderr_str):
+        if signal_name:
+            state = STATE_FAILED
+        elif _output_indicates_xpassed(stdout_str, stderr_str):
             state = STATE_FAILED
         elif result.returncode == 0:
             if _output_indicates_xfailed(stdout_str, stderr_str):
@@ -290,11 +308,20 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         }
         status = status_map[state]
         status_msg = f"{status} ({elapsed_time:.2f}s)\n"
+        if signal_name:
+            status_msg = f"{status} ({elapsed_time:.2f}s, signal: {signal_name})\n"
         print(status_msg, end='')
         log_file.write(status_msg)
         log_file.flush()
 
-        return success, elapsed_time, timed_out, state
+        return {
+            'success': success,
+            'elapsed_time': elapsed_time,
+            'timed_out': timed_out,
+            'state': state,
+            'returncode': result.returncode,
+            'signal_name': signal_name,
+        }
 
     except subprocess.TimeoutExpired as e:
         elapsed_time = time.time() - start_time
@@ -314,7 +341,14 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
             pass
         log_file.flush()
 
-        return False, elapsed_time, True, STATE_TIMEDOUT
+        return {
+            'success': False,
+            'elapsed_time': elapsed_time,
+            'timed_out': True,
+            'state': STATE_TIMEDOUT,
+            'returncode': None,
+            'signal_name': None,
+        }
 
     except Exception as e:
         elapsed_time = time.time() - start_time
@@ -322,7 +356,14 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False):
         print(error_msg, end='')
         log_file.write(error_msg)
         log_file.flush()
-        return False, elapsed_time, False, STATE_ERROR
+        return {
+            'success': False,
+            'elapsed_time': elapsed_time,
+            'timed_out': False,
+            'state': STATE_ERROR,
+            'returncode': None,
+            'signal_name': None,
+        }
 
 
 def _node_file(node_id: str) -> str:
@@ -513,6 +554,10 @@ def _record_file_batch_result(node_id, state, elapsed, log_file, index, total):
         'time': elapsed,
         'timed_out': state == STATE_TIMEDOUT,
         'state': state,
+        'attempts': 1,
+        'flaky': False,
+        'consistent_failure': state in (STATE_FAILED, STATE_ERROR),
+        'signal_name': None,
     }
 
 
@@ -528,6 +573,8 @@ def _run_file_batch(file_name, node_ids, args, log_file):
         cmd = ['pytest', '-vv', '--timeout', str(args.per_test_timeout)] + targets + [
             '--junitxml', str(junit_path)
         ]
+        if args.reruns > 0:
+            cmd.extend(['--reruns', str(args.reruns)])
         header = (
             f"\n{'='*70}\n"
             f"Running file batch: {file_name} ({len(node_ids)} collected test(s))\n"
@@ -1042,6 +1089,8 @@ def _write_run_summary(results, start_time, log_file, summary_title):
     failed_count = sum(1 for r in results if r.get('state') == STATE_FAILED)
     timedout_count = sum(1 for r in results if r.get('state') == STATE_TIMEDOUT)
     missed_count = sum(1 for r in results if r.get('state') == STATE_MISSED)
+    flaky_count = sum(1 for r in results if r.get('flaky'))
+    consistent_failure_count = sum(1 for r in results if r.get('consistent_failure'))
     summary = f"\n{'='*70}\n{summary_title}\n{'='*70}\n"
     summary += f"Total tests run: {len(results)}\n"
     summary += f"Passed: {passed}\n"
@@ -1051,7 +1100,21 @@ def _write_run_summary(results, start_time, log_file, summary_title):
     summary += f"Failed: {failed_count}\n"
     summary += f"Timed out: {timedout_count}\n"
     summary += f"Missed: {missed_count}\n"
+    summary += f"Recovered flaky: {flaky_count}\n"
+    summary += f"Consistent failures: {consistent_failure_count}\n"
     summary += f"Total time: {total_time:.2f}s\n"
+    flaky_tests = [r for r in results if r.get('flaky')]
+    if flaky_tests:
+        summary += "\nRecovered flaky tests:\n"
+        for r in flaky_tests:
+            summary += f"  - {r['name']} ({r['time']:.2f}s, attempts={r.get('attempts', 1)})\n"
+    consistent_failures = [r for r in results if r.get('consistent_failure')]
+    if consistent_failures:
+        summary += "\nConsistent failure tests:\n"
+        for r in consistent_failures:
+            signal_name = r.get('signal_name')
+            signal_part = f", signal={signal_name}" if signal_name else ""
+            summary += f"  - {r['name']} ({r['time']:.2f}s, attempts={r.get('attempts', 1)}{signal_part})\n"
     for state, label in [
         (STATE_PASSED, "Passed"),
         (STATE_SKIPPED, "Skipped"),
@@ -1065,7 +1128,9 @@ def _write_run_summary(results, start_time, log_file, summary_title):
         if subset:
             summary += f"\n{label} tests:\n"
             for r in subset:
-                summary += f"  - {r['name']} ({r['time']:.2f}s)\n"
+                signal_name = r.get('signal_name')
+                signal_part = f", signal={signal_name}" if signal_name else ""
+                summary += f"  - {r['name']} ({r['time']:.2f}s{signal_part})\n"
     summary += f"{'='*70}\n\n"
     print(summary, end='')
     log_file.write(summary)
@@ -1079,31 +1144,84 @@ def _run_one_test_with_progress(test_name, index, total, args, log_file, by_id, 
     print(progress_msg, end='')
     log_file.write(progress_msg)
     log_file.flush()
-    timed_out = False
-    state = STATE_FAILED
-    try:
-        success, elapsed, timed_out, state = run_test(
-            test_name, args.pytorch_path, log_file,
-            timeout=timeout,
-            by_id=by_id
-        )
-    except subprocess.TimeoutExpired:
-        elapsed = float(timeout)
-        timeout_msg = f"✗ TIMEOUT (uncaught in run_test) after {elapsed:.2f}s\n"
-        print(timeout_msg, end='')
-        log_file.write(timeout_msg)
+
+    total_attempts = args.reruns + 1
+    attempts = []
+    for attempt in range(1, total_attempts + 1):
+        try:
+            attempt_result = run_test(
+                test_name, args.pytorch_path, log_file,
+                timeout=timeout,
+                by_id=by_id,
+                attempt=attempt,
+                total_attempts=total_attempts,
+            )
+        except subprocess.TimeoutExpired:
+            attempt_result = {
+                'success': False,
+                'elapsed_time': float(timeout),
+                'timed_out': True,
+                'state': STATE_TIMEDOUT,
+                'returncode': None,
+                'signal_name': None,
+            }
+            timeout_msg = f"✗ TIMEOUT (uncaught in run_test) after {timeout:.2f}s\n"
+            print(timeout_msg, end='')
+            log_file.write(timeout_msg)
+            log_file.flush()
+        except Exception as e:
+            attempt_result = {
+                'success': False,
+                'elapsed_time': 0.0,
+                'timed_out': False,
+                'state': STATE_ERROR,
+                'returncode': None,
+                'signal_name': None,
+            }
+            err_msg = f"✗ ERROR (uncaught): {type(e).__name__}: {e}\n"
+            print(err_msg, end='')
+            log_file.write(err_msg)
+            log_file.flush()
+
+        attempts.append(attempt_result)
+        if attempt_result['success']:
+            break
+        if attempt < total_attempts:
+            retry_msg = (
+                f"Retrying {test_name} after {attempt_result['state']} "
+                f"(attempt {attempt + 1}/{total_attempts})\n"
+            )
+            print(retry_msg, end='')
+            log_file.write(retry_msg)
+            log_file.flush()
+
+    final_result = attempts[-1]
+    success = final_result['success']
+    state = final_result['state']
+    elapsed = sum(result.get('elapsed_time', 0.0) for result in attempts)
+    timed_out = any(result.get('timed_out') for result in attempts)
+    flaky = len(attempts) > 1 and success
+    consistent_failure = not success and state in (STATE_FAILED, STATE_ERROR)
+    if flaky:
+        msg = f"Recovered flaky test after {len(attempts)} attempts: {test_name}\n"
+        print(msg, end='')
+        log_file.write(msg)
         log_file.flush()
-        success, elapsed, state = False, elapsed, STATE_TIMEDOUT
-        timed_out = True
-    except Exception as e:
-        err_msg = f"✗ ERROR (uncaught): {type(e).__name__}: {e}\n"
-        print(err_msg, end='')
-        log_file.write(err_msg)
+    elif consistent_failure and len(attempts) > 1:
+        msg = f"Consistent failure after {len(attempts)} attempts: {test_name}\n"
+        print(msg, end='')
+        log_file.write(msg)
         log_file.flush()
-        success, elapsed, state = False, 0.0, STATE_ERROR
+
     return {
         'name': test_name, 'success': success, 'time': elapsed,
-        'timed_out': timed_out, 'state': state,
+        'timed_out': timed_out,
+        'state': state,
+        'attempts': len(attempts),
+        'flaky': flaky,
+        'consistent_failure': consistent_failure,
+        'signal_name': final_result.get('signal_name'),
+        'returncode': final_result.get('returncode'),
     }
 
 
@@ -1495,6 +1613,7 @@ def _concurrent_worker_main(worker_spec, args_dict, result_queue):
             log_file.write(f"GPU: {gpu_id}\n")
             log_file.write(f"Mode: full_suite\n")
             log_file.write(f"Batch mode: {args.batch_mode}\n")
+            log_file.write(f"Reruns: {args.reruns}\n")
             log_file.write(f"Worker start: {start_time}\n")
             log_file.write(f"Assigned suites: {len(assigned_groups)}\n")
             log_file.write(f"Assigned tests: {len(worker_test_names)}\n\n")
@@ -1569,6 +1688,7 @@ def _run_concurrent_full_suite_batch(test_names, args, log_file, mode, count_pre
     manifest = {
         'mode': mode,
         'batch_mode': args.batch_mode,
+        'reruns': args.reruns,
         'num_gpus': args.num_gpus,
         'num_workers': num_workers,
         'total_tests': len(test_names),
@@ -1582,12 +1702,14 @@ def _run_concurrent_full_suite_batch(test_names, args, log_file, mode, count_pre
     msg = (
         f"{count_prefix} Running with suite-level GPU concurrency. "
         f"Workers: {num_workers}, GPUs: 0-{num_workers - 1}. "
+        f"Reruns: {args.reruns}. "
         f"Manifest: {manifest_path}\n\n"
     )
     print(msg, end='')
     log_file.write(msg)
     log_file.write("Mode: full_suite\n")
     log_file.write(f"Batch mode: {args.batch_mode}\n")
+    log_file.write(f"Reruns: {args.reruns}\n")
     log_file.write(f"Num GPUs: {args.num_gpus}\n")
     log_file.write(f"Concurrent manifest: {manifest_path}\n")
     log_file.write(f"Concurrent start: {start_time}\n")
@@ -1664,7 +1786,8 @@ def _run_full_suite_batch(test_names, start_index, args, log_file, mode, count_p
     if args.batch_mode == BATCH_MODE_FILE:
         count_msg = (
             f"{count_prefix} Running in file batches. "
-            f"Per-file timeout: {args.per_file_timeout}s"
+            f"Per-file timeout: {args.per_file_timeout}s. "
+            f"Reruns: {args.reruns}"
         )
         return _run_file_batch_mode(
             test_names, start_index, args, log_file, mode,
@@ -1673,14 +1796,15 @@ def _run_full_suite_batch(test_names, start_index, args, log_file, mode, count_p
     if args.batch_mode == BATCH_MODE_SHARD:
         count_msg = (
             f"{count_prefix} Running in shards of up to {args.shard_size} test(s). "
-            f"Per-file timeout: {args.per_file_timeout}s"
+            f"Per-file timeout: {args.per_file_timeout}s. "
+            f"Reruns: {args.reruns}"
         )
         return _run_shard_batch_mode(
             test_names, start_index, args, log_file, mode,
             count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
         )
 
-    count_msg = f"{count_prefix} Per-test timeout: {args.per_test_timeout}s"
+    count_msg = f"{count_prefix} Per-test timeout: {args.per_test_timeout}s. Reruns: {args.reruns}"
     return _run_test_batch(
         test_names, start_index, args, log_file, mode, by_id=True,
         count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
@@ -1741,6 +1865,13 @@ def main():
         '--stop-on-failure',
         action='store_true',
         help='Stop running tests after the first failure (default: continue on failure)'
+    )
+    parser.add_argument(
+        '--reruns',
+        type=int,
+        default=2,
+        metavar='N',
+        help='Number of times to rerun a failed test before recording final failure (default: 2; use 0 for no reruns)'
     )
     parser.add_argument(
         '--per-test-timeout',
@@ -1862,6 +1993,9 @@ def main():
         print("Warning: --regex only applies to full-suite mode (--all-tests); ignoring --regex.\n")
     if args.per_test_timeout is None:
         args.per_test_timeout = DEFAULT_PER_TEST_TIMEOUT_SECONDS
+    if args.reruns < 0:
+        print("Error: --reruns must be a non-negative integer")
+        sys.exit(1)
     if args.shard_size <= 0:
         print("Error: --shard-size must be a positive integer")
         sys.exit(1)
