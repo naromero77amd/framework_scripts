@@ -91,11 +91,18 @@ Full-suite mode starts from a list of files under `PYTORCH_PATH/test/`.
 
 Batch modes apply only to full-suite mode (`--all-tests`). CSV mode and rerun-failed mode use per-test subprocess execution.
 
-## Reruns And Failure Reporting
+## Retry Attempts And Failure Reporting
 
-By default, failed single-test executions are retried up to two times, matching PyTorch's normal rerun count. Use `--reruns 0` to disable retries entirely.
+By default, failed test executions are retried up to two times, matching PyTorch's normal retry count. Use `--retry-attempts 0` to disable retries entirely.
 
 Recovered tests are reported separately as flaky, while tests that still fail after all attempts are reported as consistent failures. Signal-based exits, such as `SIGKILL` or `SIGSEGV`, are categorized as failed tests and include the signal name in the per-test log and final summary.
+
+Retry attempts and rerun-failed mode are different:
+
+| Concept | Option | When it happens | Purpose |
+|---------|--------|-----------------|---------|
+| Retry attempts | `--retry-attempts N` | During the current run, immediately after a failed test attempt. | Give a failed test another chance before recording final status. |
+| Rerun-failed mode | `--rerun-failed LOG_FILE` | In a later run, using a previous log. | Build a new test list from tests that failed in an earlier run. |
 
 ## Suite-Level GPU Concurrency
 
@@ -200,12 +207,12 @@ This gives file and shard mode most of the speed benefit of batched execution wh
   - `Failed tests:` summary section
   - `Timed out tests:` summary section
 - It does not read JUnit XML. It uses only the text log passed to `--rerun-failed`.
-- It always reruns selected tests one at a time:
+- It always runs selected tests one at a time:
   - Previous `Mode: full_suite` logs rerun entries as full pytest node IDs.
   - Previous `Mode: csv` logs rerun entries as `-k` keyword expressions against the default inductor test file.
 - `--batch-mode`, `--per-file-timeout`, and `--shard-size` do not apply to rerun-failed mode.
-- The current parser does not select `ERROR` or `MISSED` summary sections for rerun.
-- Rerun mode creates a new log file named like `{input_stem}.rerun_{timestamp}.log`.
+- The current parser does not select `ERROR` or `MISSED` summary sections for rerun-failed mode.
+- Rerun-failed mode creates a new log file named like `{input_stem}.rerun_{timestamp}.log`.
 - If there are no tests to rerun, the script exits successfully.
 
 ## Collect-Only Mode
@@ -252,7 +259,7 @@ Each test is classified into exactly one state:
 
 - Every run logs the PyTorch path and log file path.
 - CSV and full-suite runs write `Mode: csv` or `Mode: full_suite`.
-- Rerun-failed logs preserve the original mode (`Mode: csv` or `Mode: full_suite`) so later reruns know whether entries are CSV keywords or full pytest node IDs.
+- Rerun-failed logs preserve the original mode (`Mode: csv` or `Mode: full_suite`) so later rerun-failed runs know whether entries are CSV keywords or full pytest node IDs.
 - Each recorded test has:
   - a progress line: `[N/TOTAL]`
   - a `Running: <test_name>` header
@@ -286,7 +293,7 @@ Each test is classified into exactly one state:
 | `--pytorch-path PATH` | All modes | Path to the PyTorch checkout. |
 | `--log-file PATH` | All modes except `--collect-only` | Path for the run log. |
 | `--stop-on-failure` | All execution modes | Stop after first failing test or fallback failure. |
-| `--reruns N` | All execution modes | Number of times to rerun a failed test before recording final failure. Default: 2; use 0 for no reruns. |
+| `--retry-attempts N` | All execution modes | Number of times to retry a failed test before recording final failure. Default: 2; use 0 for no retries. |
 | `--batch-mode {file,shard,test}` | Full-suite mode only | Full-suite execution granularity. Default: `file`. |
 | `--num-gpus N` | Full-suite mode only | Run up to N test suites concurrently, one worker per GPU. Default: 1. |
 | `--per-file-timeout SECONDS` | Full-suite `file`/`shard` batch modes | Outer timeout for file or shard subprocesses. Default: 43200. |
@@ -333,6 +340,9 @@ python run_tests.py --include-triton-nightly-inductor-tests --pytorch-path /path
 
 # Run the ROCm torch-triton-nightly Inductor validation subset across 8 GPUs
 python run_tests.py --include-triton-nightly-inductor-tests --num-gpus 8 --pytorch-path /path/to/pytorch
+
+# Run without retrying failed test attempts
+python run_tests.py --all-tests --retry-attempts 0 --pytorch-path /path/to/pytorch
 
 # Resume a previous full-suite run
 python run_tests.py --all-tests --pytorch-path /path/to/pytorch --log-file full_run.log --resume

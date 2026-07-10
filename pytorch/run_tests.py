@@ -573,8 +573,8 @@ def _run_file_batch(file_name, node_ids, args, log_file):
         cmd = ['pytest', '-vv', '--timeout', str(args.per_test_timeout)] + targets + [
             '--junitxml', str(junit_path)
         ]
-        if args.reruns > 0:
-            cmd.extend(['--reruns', str(args.reruns)])
+        if args.retry_attempts > 0:
+            cmd.extend(['--reruns', str(args.retry_attempts)])
         header = (
             f"\n{'='*70}\n"
             f"Running file batch: {file_name} ({len(node_ids)} collected test(s))\n"
@@ -1145,7 +1145,7 @@ def _run_one_test_with_progress(test_name, index, total, args, log_file, by_id, 
     log_file.write(progress_msg)
     log_file.flush()
 
-    total_attempts = args.reruns + 1
+    total_attempts = args.retry_attempts + 1
     attempts = []
     for attempt in range(1, total_attempts + 1):
         try:
@@ -1613,7 +1613,7 @@ def _concurrent_worker_main(worker_spec, args_dict, result_queue):
             log_file.write(f"GPU: {gpu_id}\n")
             log_file.write(f"Mode: full_suite\n")
             log_file.write(f"Batch mode: {args.batch_mode}\n")
-            log_file.write(f"Reruns: {args.reruns}\n")
+            log_file.write(f"Retry attempts: {args.retry_attempts}\n")
             log_file.write(f"Worker start: {start_time}\n")
             log_file.write(f"Assigned suites: {len(assigned_groups)}\n")
             log_file.write(f"Assigned tests: {len(worker_test_names)}\n\n")
@@ -1688,7 +1688,7 @@ def _run_concurrent_full_suite_batch(test_names, args, log_file, mode, count_pre
     manifest = {
         'mode': mode,
         'batch_mode': args.batch_mode,
-        'reruns': args.reruns,
+        'retry_attempts': args.retry_attempts,
         'num_gpus': args.num_gpus,
         'num_workers': num_workers,
         'total_tests': len(test_names),
@@ -1702,14 +1702,14 @@ def _run_concurrent_full_suite_batch(test_names, args, log_file, mode, count_pre
     msg = (
         f"{count_prefix} Running with suite-level GPU concurrency. "
         f"Workers: {num_workers}, GPUs: 0-{num_workers - 1}. "
-        f"Reruns: {args.reruns}. "
+        f"Retry attempts: {args.retry_attempts}. "
         f"Manifest: {manifest_path}\n\n"
     )
     print(msg, end='')
     log_file.write(msg)
     log_file.write("Mode: full_suite\n")
     log_file.write(f"Batch mode: {args.batch_mode}\n")
-    log_file.write(f"Reruns: {args.reruns}\n")
+    log_file.write(f"Retry attempts: {args.retry_attempts}\n")
     log_file.write(f"Num GPUs: {args.num_gpus}\n")
     log_file.write(f"Concurrent manifest: {manifest_path}\n")
     log_file.write(f"Concurrent start: {start_time}\n")
@@ -1787,7 +1787,7 @@ def _run_full_suite_batch(test_names, start_index, args, log_file, mode, count_p
         count_msg = (
             f"{count_prefix} Running in file batches. "
             f"Per-file timeout: {args.per_file_timeout}s. "
-            f"Reruns: {args.reruns}"
+            f"Retry attempts: {args.retry_attempts}"
         )
         return _run_file_batch_mode(
             test_names, start_index, args, log_file, mode,
@@ -1797,14 +1797,14 @@ def _run_full_suite_batch(test_names, start_index, args, log_file, mode, count_p
         count_msg = (
             f"{count_prefix} Running in shards of up to {args.shard_size} test(s). "
             f"Per-file timeout: {args.per_file_timeout}s. "
-            f"Reruns: {args.reruns}"
+            f"Retry attempts: {args.retry_attempts}"
         )
         return _run_shard_batch_mode(
             test_names, start_index, args, log_file, mode,
             count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
         )
 
-    count_msg = f"{count_prefix} Per-test timeout: {args.per_test_timeout}s. Reruns: {args.reruns}"
+    count_msg = f"{count_prefix} Per-test timeout: {args.per_test_timeout}s. Retry attempts: {args.retry_attempts}"
     return _run_test_batch(
         test_names, start_index, args, log_file, mode, by_id=True,
         count_msg=count_msg, summary_title="TEST SUMMARY (full suite)"
@@ -1867,11 +1867,19 @@ def main():
         help='Stop running tests after the first failure (default: continue on failure)'
     )
     parser.add_argument(
-        '--reruns',
+        '--retry-attempts',
         type=int,
         default=2,
         metavar='N',
-        help='Number of times to rerun a failed test before recording final failure (default: 2; use 0 for no reruns)'
+        help='Number of times to retry a failed test before recording final failure (default: 2; use 0 for no retries)'
+    )
+    # Backward-compatible alias for the original option name. Keep it hidden so
+    # the CLI distinguishes retry attempts from --rerun-failed mode.
+    parser.add_argument(
+        '--reruns',
+        dest='retry_attempts',
+        type=int,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         '--per-test-timeout',
@@ -1993,8 +2001,8 @@ def main():
         print("Warning: --regex only applies to full-suite mode (--all-tests); ignoring --regex.\n")
     if args.per_test_timeout is None:
         args.per_test_timeout = DEFAULT_PER_TEST_TIMEOUT_SECONDS
-    if args.reruns < 0:
-        print("Error: --reruns must be a non-negative integer")
+    if args.retry_attempts < 0:
+        print("Error: --retry-attempts must be a non-negative integer")
         sys.exit(1)
     if args.shard_size <= 0:
         print("Error: --shard-size must be a positive integer")
@@ -2072,7 +2080,11 @@ def main():
                 log_file.write(msg)
                 log_file.write(f"Mode: {mode}\n")
                 log_file.flush()
-                count_msg = f"Re-running {len(tests_to_rerun)} test(s). Per-test timeout: {args.per_test_timeout}s"
+                count_msg = (
+                    f"Re-running {len(tests_to_rerun)} test(s). "
+                    f"Per-test timeout: {args.per_test_timeout}s. "
+                    f"Retry attempts: {args.retry_attempts}"
+                )
                 exit_code = _run_test_batch(
                     tests_to_rerun, 0, args, log_file, mode, by_id=(mode == 'full_suite'),
                     count_msg=count_msg, summary_title="TEST SUMMARY (rerun failed)"
