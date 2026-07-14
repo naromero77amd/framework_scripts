@@ -923,12 +923,9 @@ def read_tests_from_csv(csv_file):
         sys.exit(1)
 
 
-def discover_inductor_core_files(pytorch_path):
+def discover_inductor_all_files(pytorch_path):
     """
-    Return the test/ relative file paths for PyTorch's CI inductor_core suite.
-
-    Mirrors .ci/pytorch/test.sh:test_inductor_core, which runs all discovered
-    inductor tests and then applies explicit exclusions.
+    Return every test/ relative file path under PyTorch's test/inductor suite.
     """
     pytorch_root = Path(pytorch_path)
     sys.path.insert(0, str(pytorch_root))
@@ -940,31 +937,20 @@ def discover_inductor_core_files(pytorch_path):
         except ValueError:
             pass
 
-    test_script = pytorch_root / '.ci' / 'pytorch' / 'test.sh'
-    content = test_script.read_text(encoding='utf-8')
-    try:
-        start = content.index('test_inductor_core()')
-        end = content.index('assert_git_not_dirty', start)
-    except ValueError as e:
-        raise RuntimeError(
-            f"Could not find test_inductor_core block in {test_script}"
-        ) from e
-
-    block = content[start:end]
-    excluded = {
-        path[:-3] if path.endswith('.py') else path
-        for path in re.findall(r'inductor/[A-Za-z0-9_/.]+', block)
-    }
-
     files = [
         f'{test_name}.py'
         for test_name in sorted(TESTS)
-        if test_name.startswith('inductor/') and test_name not in excluded
+        if test_name.startswith('inductor/')
     ]
 
     if not files:
-        raise RuntimeError("No inductor_core test files were discovered.")
+        raise RuntimeError("No inductor test files were discovered.")
     return files
+
+
+def discover_inductor_core_files(pytorch_path):
+    """Backward-compatible alias for the all-Inductor suite selector."""
+    return discover_inductor_all_files(pytorch_path)
 
 
 def triton_nightly_inductor_files():
@@ -1833,7 +1819,7 @@ def main():
         '--include-inductor-all-tests',
         action='store_true',
         dest='include_inductor_all_tests',
-        help='Add PyTorch CI inductor_core test files from PYTORCH_PATH; implies --all-tests'
+        help='Add every PyTorch test/inductor test file from PYTORCH_PATH; implies --all-tests'
     )
     parser.add_argument(
         '--include-triton-nightly-inductor-tests',
@@ -1949,12 +1935,12 @@ def main():
     if args.include_inductor_all_tests:
         args.all_tests = True
         try:
-            inductor_files = discover_inductor_core_files(args.pytorch_path)
+            inductor_files = discover_inductor_all_files(args.pytorch_path)
         except RuntimeError as e:
             print(f"Error: {e}")
             sys.exit(1)
         args.input_files = list(dict.fromkeys((args.input_files or []) + inductor_files))
-        print(f"Added {len(inductor_files)} inductor_core test file(s).")
+        print(f"Added {len(inductor_files)} inductor test file(s).")
 
     if args.include_triton_nightly_inductor_tests:
         args.all_tests = True

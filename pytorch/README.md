@@ -76,7 +76,7 @@ Full-suite mode starts from a list of files under `PYTORCH_PATH/test/`.
 
 - **Default**: Without `-i` or a shortcut, the script uses `test/inductor/test_torchinductor.py`.
 - **Explicit files**: Use `-i FILE [FILE ...]` to provide files relative to `test/`, such as `-i test_ops.py inductor/test_config.py`.
-- **Inductor all shortcut**: `--include-inductor-all-tests` derives the same file set as PyTorch CI's `inductor_core` configuration by reading `tools/testing/discover_tests.py` and `.ci/pytorch/test.sh::test_inductor_core` from `PYTORCH_PATH`. It implies `--all-tests` and appends those files to any files passed with `-i`, de-duplicating the final list.
+- **Inductor all shortcut**: `--include-inductor-all-tests` adds every test file under `PYTORCH_PATH/test/inductor` that is registered in PyTorch's `tools/testing/discover_tests.py`. It implies `--all-tests` and appends those files to any files passed with `-i`, de-duplicating the final list.
 - **Triton nightly Inductor shortcut**: `--include-triton-nightly-inductor-tests` adds the seven files used by ROCm's `pytorch-ci-scripts/torch-triton-nightly/inductor-tests.py`:
   - `inductor/test_torchinductor.py`
   - `inductor/test_flex_attention.py`
@@ -286,7 +286,7 @@ Each test is classified into exactly one state:
 |----------|------------|-------------|
 | `csv_file` | CSV mode | Path to CSV with a `test_name` column. Omit when using `--all-tests` or `--rerun-failed`. |
 | `--all-tests` | Full-suite mode | Discover and run tests in the configured full-suite file list. |
-| `--include-inductor-all-tests` | Full-suite mode | Add PyTorch CI `inductor_core` test files from `--pytorch-path`; implies `--all-tests`. |
+| `--include-inductor-all-tests` | Full-suite mode | Add every registered PyTorch `test/inductor` test file from `--pytorch-path`; implies `--all-tests`. |
 | `--include-triton-nightly-inductor-tests` | Full-suite mode | Add ROCm torch-triton-nightly Inductor validation files; implies `--all-tests`. |
 | `--rerun-failed LOG_FILE` | Rerun-failed mode | Rerun failed tests from a previous text log. |
 | `--rerun-include-timeouts` | Rerun-failed mode | Also rerun timed-out tests from the previous log. |
@@ -317,7 +317,7 @@ python run_tests.py --all-tests --pytorch-path /path/to/pytorch
 # Run full suite in 100-test shards
 python run_tests.py --all-tests --batch-mode shard --shard-size 100 --pytorch-path /path/to/pytorch
 
-# Run the PyTorch CI inductor_core file set with suite-level concurrency on 4 GPUs
+# Run every registered PyTorch test/inductor file with suite-level concurrency on 4 GPUs
 python run_tests.py --include-inductor-all-tests --num-gpus 4 --pytorch-path /path/to/pytorch
 
 # Run two explicit suites concurrently, with each suite internally using shard mode
@@ -332,7 +332,7 @@ python run_tests.py --all-tests --pytorch-path /path/to/pytorch --regex GPUTests
 # Run full suite from specific test files under test/
 python run_tests.py --all-tests -i test_ops.py inductor/test_config.py --pytorch-path /path/to/pytorch
 
-# Run the PyTorch CI inductor_core file set
+# Run every registered PyTorch test/inductor file
 python run_tests.py --include-inductor-all-tests --pytorch-path /path/to/pytorch
 
 # Run the ROCm torch-triton-nightly Inductor validation subset
