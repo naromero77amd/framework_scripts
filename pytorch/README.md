@@ -23,7 +23,7 @@ Use exactly one of these modes:
 
 | Mode | How to invoke | Description |
 |------|---------------|-------------|
-| CSV | `csv_file` positional argument | Run tests listed in a CSV file with a `test_name` column. |
+| CSV | `csv_file` positional argument | Run pytest node IDs listed in a CSV file with a `test_name` column. |
 | Full suite | `--all-tests` | Discover tests from one or more files under `PYTORCH_PATH/test/`, then run them with the selected batch mode. |
 | Rerun failed | `--rerun-failed LOG_FILE` | Parse a previous log and rerun failed tests. Add `--rerun-include-timeouts` to include timed-out tests. |
 
@@ -36,7 +36,7 @@ Run modes and batch modes are separate concepts:
 Examples:
 
 ```bash
-# CSV mode
+# CSV mode with exact pytest node IDs
 python run_tests.py my_tests.csv --pytorch-path /path/to/pytorch
 
 # Full-suite mode with the default inductor test file
@@ -52,11 +52,21 @@ python run_tests.py --pytorch-path /path/to/pytorch --rerun-failed test_results_
 ## CSV Mode
 
 - The CSV must have a column named `test_name`.
-- Each row is used as a pytest keyword expression with `-k`.
+- Each `test_name` row must be a full pytest node ID, such as `test/inductor/test_flex_attention.py::TestFlexAttentionCUDA::test_block_mask_non_divisible_cuda`.
+- CSV node IDs are passed directly to pytest; they are not treated as `-k` keyword expressions.
+- Legacy keyword-only rows are rejected during CSV parsing with a clear error.
 - Empty `test_name` rows are skipped.
 - Rows whose `test_name` starts with `#` are treated as comments.
 - CSV tests run in the order they appear in the file.
-- CSV mode uses the default inductor test file (`test/inductor/test_torchinductor.py`).
+- CSV mode can run node IDs from any test file under the provided PyTorch checkout.
+
+Example:
+
+```csv
+test_name
+test/inductor/test_flex_attention.py::TestFlexAttentionCUDA::test_block_mask_non_divisible_cuda
+test/inductor/test_aot_inductor.py::AOTInductorTestABICompatibleGpu::test_libtorch_free_so_cuda
+```
 
 ## Full-Suite Mode
 
@@ -207,9 +217,7 @@ This gives file and shard mode most of the speed benefit of batched execution wh
   - `Failed tests:` summary section
   - `Timed out tests:` summary section
 - It does not read JUnit XML. It uses only the text log passed to `--rerun-failed`.
-- It always runs selected tests one at a time:
-  - Previous `Mode: full_suite` logs rerun entries as full pytest node IDs.
-  - Previous `Mode: csv` logs rerun entries as `-k` keyword expressions against the default inductor test file.
+- It always runs selected tests one at a time as full pytest node IDs.
 - `--batch-mode`, `--per-file-timeout`, and `--shard-size` do not apply to rerun-failed mode.
 - The current parser does not select `ERROR` or `MISSED` summary sections for rerun-failed mode.
 - Rerun-failed mode creates a new log file named like `{input_stem}.rerun_{timestamp}.log`.
@@ -259,7 +267,7 @@ Each test is classified into exactly one state:
 
 - Every run logs the PyTorch path and log file path.
 - CSV and full-suite runs write `Mode: csv` or `Mode: full_suite`.
-- Rerun-failed logs preserve the original mode (`Mode: csv` or `Mode: full_suite`) so later rerun-failed runs know whether entries are CSV keywords or full pytest node IDs.
+- Rerun-failed logs preserve the original mode (`Mode: csv` or `Mode: full_suite`) for provenance; failed entries are rerun as full pytest node IDs.
 - Each recorded test has:
   - a progress line: `[N/TOTAL]`
   - a `Running: <test_name>` header
@@ -284,7 +292,7 @@ Each test is classified into exactly one state:
 
 | Argument | Applies To | Description |
 |----------|------------|-------------|
-| `csv_file` | CSV mode | Path to CSV with a `test_name` column. Omit when using `--all-tests` or `--rerun-failed`. |
+| `csv_file` | CSV mode | Path to CSV with a `test_name` column containing full pytest node IDs. Omit when using `--all-tests` or `--rerun-failed`. |
 | `--all-tests` | Full-suite mode | Discover and run tests in the configured full-suite file list. |
 | `--include-inductor-all-tests` | Full-suite mode | Add every registered PyTorch `test/inductor` test file from `--pytorch-path`; implies `--all-tests`. |
 | `--include-triton-nightly-inductor-tests` | Full-suite mode | Add ROCm torch-triton-nightly Inductor validation files; implies `--all-tests`. |

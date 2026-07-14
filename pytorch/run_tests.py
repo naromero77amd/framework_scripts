@@ -220,7 +220,7 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False, attemp
     Args:
         test_name: Name of the test to run. When by_id=True this is a full pytest node id
                    (e.g. path::Class::test_method or path::Class::test_method[param]); we run
-                   pytest with that node id for 1:1 mapping. When by_id=False, pass as -k <test_name> (CSV/keyword mode).
+                   pytest with that node id for 1:1 mapping. When by_id=False, pass as -k <test_name>.
         pytorch_path: Path to PyTorch directory
         log_file: File object to write logs to
         timeout: Timeout in seconds for this test (default 300)
@@ -234,10 +234,11 @@ def run_test(test_name, pytorch_path, log_file, timeout=300, by_id=False, attemp
     test_file = Path(pytorch_path) / TEST_FILE_REL_PATH
 
     if by_id:
-        # Full-suite: test_name is a full pytest node id. Per-test timeout via pytest-timeout.
+        # Full-suite/CSV node-id mode: test_name is a full pytest node id.
+        # Per-test timeout is handled via pytest-timeout.
         cmd = ['pytest', '--timeout', str(timeout), test_name]
     else:
-        # CSV: run pytest with -k (keyword match) and per-test timeout.
+        # Legacy keyword mode: run pytest with -k and per-test timeout.
         cmd = ['pytest', TEST_FILE_REL_PATH, '-k', test_name, '--timeout', str(timeout)]
 
     env = _build_test_env()
@@ -887,16 +888,17 @@ def read_checkpoint(log_file_path):
 
 def read_tests_from_csv(csv_file):
     """
-    Read test names from CSV file.
+    Read pytest node IDs from CSV file.
     Rows whose test_name starts with '#' are treated as comments and skipped.
     
     Args:
         csv_file: Path to CSV file
         
     Returns:
-        list: List of test names
+        list: List of pytest node IDs
     """
     test_names = []
+    invalid_rows = []
     
     try:
         with open(csv_file, 'r', encoding='utf-8') as f:
@@ -907,10 +909,24 @@ def read_tests_from_csv(csv_file):
                 print(f"Found columns: {reader.fieldnames}")
                 sys.exit(1)
             
-            for row in reader:
+            for row_number, row in enumerate(reader, start=2):
                 test_name = row['test_name'].strip()
                 if test_name and not test_name.startswith('#'):  # Skip empty rows and comments
-                    test_names.append(test_name)
+                    if not _is_pytest_node_id(test_name):
+                        invalid_rows.append((row_number, test_name))
+                    else:
+                        test_names.append(test_name)
+            
+            if invalid_rows:
+                print("Error: CSV test_name values must be full pytest node IDs.")
+                print("Expected format: path/to/test_file.py::TestClass::test_method")
+                print("Example: test/inductor/test_flex_attention.py::TestFlexAttentionCUDA::test_block_mask_non_divisible_cuda")
+                print("Invalid rows:")
+                for row_number, test_name in invalid_rows[:10]:
+                    print(f"  row {row_number}: {test_name}")
+                if len(invalid_rows) > 10:
+                    print(f"  ... and {len(invalid_rows) - 10} more")
+                sys.exit(1)
         
         return test_names
         
@@ -921,6 +937,16 @@ def read_tests_from_csv(csv_file):
     except Exception as e:
         print(f"Error reading CSV file: {str(e)}")
         sys.exit(1)
+
+
+def _is_pytest_node_id(test_name):
+    """
+    Return True if test_name looks like a full pytest node ID.
+
+    This intentionally rejects the legacy CSV keyword format, because CSV mode
+    now passes test_name directly to pytest for exact test selection.
+    """
+    return '.py::' in test_name
 
 
 def discover_inductor_all_files(pytorch_path):
@@ -1808,7 +1834,7 @@ def main():
         'csv_file',
         nargs='?',
         default=None,
-        help='Path to CSV file containing test names (required unless --all-tests or --rerun-failed is used)'
+        help='Path to CSV file containing pytest node IDs in a test_name column (required unless --all-tests or --rerun-failed is used)'
     )
     parser.add_argument(
         '--all-tests',
@@ -1960,20 +1986,22 @@ def main():
         print(f"Error: PyTorch path does not exist: {args.pytorch_path}")
         sys.exit(1)
 
-    # Resolve test file(s) to check: -i list (under test/) or default single file
-    if args.all_tests and args.input_files:
-        test_file_rel_paths = [str(Path('test') / f) for f in args.input_files]
-        for rel in test_file_rel_paths:
-            if not (pytorch_path / rel).exists():
-                print(f"Error: Test file not found at: {pytorch_path / rel}")
-                print("Please verify -i filenames and PyTorch path.")
+    # Resolve full-suite test file(s) to check: -i list (under test/) or default single file.
+    # CSV and rerun-failed modes pass pytest node IDs directly, so pytest validates those paths.
+    if args.all_tests:
+        if args.input_files:
+            test_file_rel_paths = [str(Path('test') / f) for f in args.input_files]
+            for rel in test_file_rel_paths:
+                if not (pytorch_path / rel).exists():
+                    print(f"Error: Test file not found at: {pytorch_path / rel}")
+                    print("Please verify -i filenames and PyTorch path.")
+                    sys.exit(1)
+        else:
+            test_file = pytorch_path / TEST_FILE_REL_PATH
+            if not test_file.exists():
+                print(f"Error: Test file not found at: {test_file}")
+                print(f"Please verify the PyTorch path is correct.")
                 sys.exit(1)
-    else:
-        test_file = pytorch_path / TEST_FILE_REL_PATH
-        if not test_file.exists():
-            print(f"Error: Test file not found at: {test_file}")
-            print(f"Please verify the PyTorch path is correct.")
-            sys.exit(1)
     
     # Require exactly one of: CSV file, --all-tests, or --rerun-failed
     modes_set = sum([bool(args.csv_file), args.all_tests, bool(args.rerun_failed)])
@@ -2058,7 +2086,7 @@ def main():
             else:
                 ensure_pytest_and_timeout_installed()
                 if args.collect_only:
-                    _do_collect_only_and_exit(args.pytorch_path, tests_to_rerun, by_id=(mode == 'full_suite'))
+                    _do_collect_only_and_exit(args.pytorch_path, tests_to_rerun, by_id=True)
                 msg = f"Re-running failed tests from: {args.rerun_failed}\n"
                 if args.rerun_include_timeouts and timeout_tests:
                     msg += f"Including {len(timeout_tests)} timed out test(s).\n"
@@ -2072,7 +2100,7 @@ def main():
                     f"Retry attempts: {args.retry_attempts}"
                 )
                 exit_code = _run_test_batch(
-                    tests_to_rerun, 0, args, log_file, mode, by_id=(mode == 'full_suite'),
+                    tests_to_rerun, 0, args, log_file, mode, by_id=True,
                     count_msg=count_msg, summary_title="TEST SUMMARY (rerun failed)"
                 )
         elif args.all_tests:
@@ -2140,7 +2168,7 @@ def main():
                         count_prefix=f"Found {len(test_names)} test(s)."
                     )
         else:
-            # CSV mode: read test names and run each one (pytest -k, same as full-suite for execution)
+            # CSV mode: read pytest node IDs and run each one exactly.
             ensure_pytest_and_timeout_installed()
             msg = f"Reading tests from: {args.csv_file}\n"
             print(msg, end='')
@@ -2155,7 +2183,7 @@ def main():
                 log_file.close()
                 sys.exit(1)
             if args.collect_only:
-                _do_collect_only_and_exit(args.pytorch_path, test_names, by_id=False)
+                _do_collect_only_and_exit(args.pytorch_path, test_names, by_id=True)
             mode = 'csv'
             start_index = _resolve_start_index(
                 test_names, args.log_file, args.resume, args.no_checkpoint, log_file,
@@ -2163,7 +2191,7 @@ def main():
             )
             count_msg = f"Found {len(test_names)} test(s) to run"
             exit_code = _run_test_batch(
-                test_names, start_index, args, log_file, mode, by_id=False,
+                test_names, start_index, args, log_file, mode, by_id=True,
                 count_msg=count_msg, summary_title="TEST SUMMARY"
             )
 
