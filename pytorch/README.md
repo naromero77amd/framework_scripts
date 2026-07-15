@@ -120,6 +120,8 @@ Use `--num-gpus N` to run full-suite test files concurrently across GPUs. This i
 
 `--num-gpus > 1` is initially supported only with full-suite mode (`--all-tests`, including the full-suite shortcuts, `-i`, and `--regex`). CSV mode and rerun-failed mode reject `--num-gpus > 1`.
 
+When `--num-gpus > 1`, the runner honors PyTorch's `CI_SERIAL_LIST` and `RUN_PARALLEL_BLOCKLIST` from `PYTORCH_PATH/test/run_test.py`. Matching suites run first in a dedicated serial phase, then the remaining suites are assigned to GPU workers. This mirrors PyTorch's file-level rule that some suites may run, but must not run concurrently with other test files.
+
 `--num-gpus` is orthogonal to `--batch-mode`:
 
 - `--batch-mode file --num-gpus 4` runs up to four test files at once, each in file mode.
@@ -144,6 +146,7 @@ flowchart TD
 Concurrent runs avoid interleaved logs:
 
 - The top-level `--log-file` path is the parent log.
+- Serial suites, when present, are written to `<log>.serial`.
 - Worker logs are written next to it as `<log>.worker0`, `<log>.worker1`, and so on.
 - The parent writes a manifest at `<log>.manifest.json`.
 - Worker checkpoints are written next to worker logs.

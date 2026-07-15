@@ -3,6 +3,7 @@
 Script to run PyTorch inductor unit tests from a CSV file.
 """
 
+import ast
 import csv
 import io
 import json
@@ -372,6 +373,16 @@ def _node_file(node_id: str) -> str:
     return node_id.split("::", 1)[0]
 
 
+def _normalize_test_file_name(file_name):
+    """Convert pytest paths to PyTorch run_test.py test names."""
+    normalized = file_name.replace("\\", "/")
+    if normalized.startswith("test/"):
+        normalized = normalized[len("test/"):]
+    if normalized.endswith(".py"):
+        normalized = normalized[:-3]
+    return normalized
+
+
 def _group_node_ids_by_file(test_names):
     """Group pytest node ids by file while preserving discovery order."""
     groups = []
@@ -389,6 +400,60 @@ def _group_node_ids_by_file(test_names):
     if current_file is not None:
         groups.append((current_file, current_nodes))
     return groups
+
+
+def _load_pytorch_serial_test_names(pytorch_path):
+    """
+    Load PyTorch's file-level serial lists from test/run_test.py.
+
+    These lists mean the test file should not run concurrently with other test
+    files. The tests inside that file may still run using that file's own batch
+    mode.
+    """
+    pytorch_root = Path(pytorch_path)
+    run_test_path = pytorch_root / "test" / "run_test.py"
+    if not run_test_path.exists():
+        return set()
+
+    def collect_strings(node):
+        if isinstance(node, ast.List):
+            return [
+                item.value
+                for item in node.elts
+                if isinstance(item, ast.Constant) and isinstance(item.value, str)
+            ]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return collect_strings(node.left) + collect_strings(node.right)
+        return []
+
+    tree = ast.parse(run_test_path.read_text(encoding='utf-8'))
+    serial_names = set()
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        target_names = [
+            target.id for target in node.targets if isinstance(target, ast.Name)
+        ]
+        if any(
+            target in {"CI_SERIAL_LIST", "RUN_PARALLEL_BLOCKLIST"}
+            for target in target_names
+        ):
+            serial_names.update(collect_strings(node.value))
+    return serial_names
+
+
+def _split_serial_and_parallel_groups(groups, pytorch_path):
+    """Split file groups using PyTorch's CI serial and run-parallel blocklists."""
+    serial_names = _load_pytorch_serial_test_names(pytorch_path)
+    serial_groups = []
+    parallel_groups = []
+    for file_name, node_ids in groups:
+        normalized = _normalize_test_file_name(file_name)
+        if normalized in serial_names:
+            serial_groups.append((file_name, node_ids))
+        else:
+            parallel_groups.append((file_name, node_ids))
+    return serial_groups, parallel_groups
 
 
 def _chunk_node_ids(node_ids, shard_size):
@@ -1500,6 +1565,10 @@ def _worker_log_path(log_file_path, worker_id):
     return str(Path(log_file_path).with_suffix(Path(log_file_path).suffix + f'.worker{worker_id}'))
 
 
+def _serial_log_path(log_file_path):
+    return str(Path(log_file_path).with_suffix(Path(log_file_path).suffix + '.serial'))
+
+
 def _write_manifest(path, manifest):
     try:
         Path(path).write_text(json.dumps(manifest, indent=2), encoding='utf-8')
@@ -1671,11 +1740,35 @@ def _concurrent_worker_main(worker_spec, args_dict, result_queue):
 def _run_concurrent_full_suite_batch(test_names, args, log_file, mode, count_prefix):
     """Run full-suite file groups concurrently across GPUs."""
     groups = _group_node_ids_by_file(test_names)
-    num_workers = min(args.num_gpus, len(groups))
-    assignments = _assign_suite_groups_to_workers(groups, num_workers)
+    serial_groups, parallel_groups = _split_serial_and_parallel_groups(
+        groups, args.pytorch_path
+    )
+    num_workers = min(args.num_gpus, len(parallel_groups))
+    assignments = (
+        _assign_suite_groups_to_workers(parallel_groups, num_workers)
+        if num_workers
+        else []
+    )
     manifest_path = _manifest_path_for_log(args.log_file)
     start_epoch = time.time()
     start_time = _now_iso()
+
+    serial_spec = None
+    if serial_groups:
+        serial_log = _serial_log_path(args.log_file)
+        serial_spec = {
+            'log': serial_log,
+            'checkpoint': checkpoint_path(serial_log),
+            'total_tests': sum(len(node_ids) for _, node_ids in serial_groups),
+            'suites': [
+                {
+                    'file_name': file_name,
+                    'test_count': len(node_ids),
+                    'node_ids': node_ids,
+                }
+                for file_name, node_ids in serial_groups
+            ],
+        }
 
     worker_specs = []
     for assignment in assignments:
@@ -1703,6 +1796,7 @@ def _run_concurrent_full_suite_batch(test_names, args, log_file, mode, count_pre
         'retry_attempts': args.retry_attempts,
         'num_gpus': args.num_gpus,
         'num_workers': num_workers,
+        'serial_suites': serial_spec,
         'total_tests': len(test_names),
         'parent_log': args.log_file,
         'manifest': manifest_path,
@@ -1713,7 +1807,9 @@ def _run_concurrent_full_suite_batch(test_names, args, log_file, mode, count_pre
 
     msg = (
         f"{count_prefix} Running with suite-level GPU concurrency. "
-        f"Workers: {num_workers}, GPUs: 0-{num_workers - 1}. "
+        f"Serial suites: {len(serial_groups)}. "
+        f"Workers: {num_workers}"
+        f"{f', GPUs: 0-{num_workers - 1}' if num_workers else ''}. "
         f"Retry attempts: {args.retry_attempts}. "
         f"Manifest: {manifest_path}\n\n"
     )
@@ -1722,10 +1818,77 @@ def _run_concurrent_full_suite_batch(test_names, args, log_file, mode, count_pre
     log_file.write("Mode: full_suite\n")
     log_file.write(f"Batch mode: {args.batch_mode}\n")
     log_file.write(f"Retry attempts: {args.retry_attempts}\n")
+    log_file.write(f"Serial suites: {len(serial_groups)}\n")
     log_file.write(f"Num GPUs: {args.num_gpus}\n")
     log_file.write(f"Concurrent manifest: {manifest_path}\n")
     log_file.write(f"Concurrent start: {start_time}\n")
     log_file.flush()
+
+    serial_result = None
+    if serial_groups and serial_spec:
+        serial_test_names = [
+            node_id for _, node_ids in serial_groups for node_id in node_ids
+        ]
+        serial_args = copy.deepcopy(args)
+        serial_args.log_file = serial_spec['log']
+        serial_args.worker_id = 'serial'
+        serial_start_epoch = time.time()
+        serial_start_time = _now_iso()
+        serial_error = None
+        serial_exit_code = 1
+        serial_counts = _result_state_counts([])
+        try:
+            with open(serial_spec['log'], 'w', encoding='utf-8') as serial_log:
+                serial_log.write("Worker: serial\n")
+                serial_log.write("GPU: inherited\n")
+                serial_log.write("Mode: full_suite\n")
+                serial_log.write(f"Batch mode: {args.batch_mode}\n")
+                serial_log.write(f"Retry attempts: {args.retry_attempts}\n")
+                serial_log.write(f"Worker start: {serial_start_time}\n")
+                serial_log.write(f"Assigned suites: {len(serial_groups)}\n")
+                serial_log.write(f"Assigned tests: {len(serial_test_names)}\n\n")
+                serial_log.flush()
+                serial_exit_code, serial_counts = _run_worker_assigned_suites(
+                    serial_groups,
+                    serial_args,
+                    serial_log,
+                    'full_suite',
+                    serial_test_names,
+                )
+                serial_end_epoch = time.time()
+                serial_log.write(f"Worker end: {_now_iso()}\n")
+                serial_log.write(
+                    f"Worker elapsed seconds: {serial_end_epoch - serial_start_epoch:.2f}\n"
+                )
+                serial_log.flush()
+        except Exception:
+            serial_error = traceback.format_exc()
+            serial_end_epoch = time.time()
+            try:
+                with open(serial_spec['log'], 'a', encoding='utf-8') as serial_log:
+                    serial_log.write("\nWorker error:\n")
+                    serial_log.write(serial_error)
+                    serial_log.write("\n")
+            except OSError:
+                pass
+        if serial_error:
+            serial_exit_code = 1
+        serial_result = {
+            'log': serial_spec['log'],
+            'checkpoint': serial_spec['checkpoint'],
+            'start_time': serial_start_time,
+            'end_time': _now_iso(),
+            'elapsed_seconds': round(serial_end_epoch - serial_start_epoch, 2),
+            'exit_code': serial_exit_code,
+            'counts': serial_counts,
+            'error': serial_error,
+        }
+        manifest['serial_suites'].update(serial_result)
+        _write_manifest(manifest_path, manifest)
+
+        if serial_exit_code != 0 and args.stop_on_failure:
+            num_workers = 0
+            worker_specs = []
 
     result_queue = multiprocessing.Queue()
     args_dict = vars(args).copy()
@@ -1747,6 +1910,14 @@ def _run_concurrent_full_suite_batch(test_names, args, log_file, mode, count_pre
     end_epoch = time.time()
     end_time = _now_iso()
     aggregate_counts = _result_state_counts([])
+    if serial_result:
+        counts = serial_result.get('counts') or {}
+        aggregate_counts['total'] += counts.get('total', 0)
+        for state in [
+            STATE_PASSED, STATE_SKIPPED, STATE_XFAILED, STATE_ERROR,
+            STATE_FAILED, STATE_TIMEDOUT, STATE_MISSED,
+        ]:
+            aggregate_counts[state] += counts.get(state, 0)
     for result in worker_results:
         counts = result.get('counts') or {}
         aggregate_counts['total'] += counts.get('total', 0)
