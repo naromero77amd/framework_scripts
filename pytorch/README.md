@@ -107,6 +107,13 @@ By default, failed test executions are retried up to two times, matching PyTorch
 
 Recovered tests are reported separately as flaky, while tests that still fail after all attempts are reported as consistent failures. Signal-based exits, such as `SIGKILL` or `SIGSEGV`, are categorized as failed tests and include the signal name in the per-test log and final summary.
 
+File and shard modes have two retry layers:
+
+1. `pytest-rerunfailures` first retries the test inside the current pytest process.
+2. If the test still fails, `-x` exits that pytest process. The runner retries the failed node alone in a fresh process, records the final result, and starts another fresh process for the unexecuted remainder of the file or shard.
+
+PyTorch's step-current pytest plugin records the active node for every file/shard child. This lets the parent recover the failure position and continue even when pytest crashes before complete JUnit XML is written.
+
 Retry attempts and rerun-failed mode are different:
 
 | Concept | Option | When it happens | Purpose |
@@ -157,7 +164,7 @@ Concurrent runs avoid interleaved logs:
 
 ### File mode: `--batch-mode file`
 
-File mode is the default. It runs one pytest subprocess per test file:
+File mode is the default. It initially runs one pytest subprocess per test file:
 
 ```bash
 pytest test/inductor/test_config.py --junitxml <tempfile>
@@ -166,6 +173,8 @@ pytest test/inductor/test_config.py --junitxml <tempfile>
 - Timeout is controlled by `--per-file-timeout` (default: 43200 seconds / 12 hours).
 - Per-test pytest-timeout is still enabled inside the file subprocess via `--per-test-timeout` (default: 1200 seconds / 20 minutes).
 - Passing files are parsed from pytest's JUnit XML output so per-test pass/skip/xfail/fail/error counts remain available.
+- Pytest output is streamed directly to the text log rather than accumulated in parent-process memory.
+- A persistent test failure or process crash can cause additional fresh pytest processes for the failed node and the remaining nodes.
 - This is the fastest mode because PyTorch and pytest startup costs are paid once per file instead of once per pytest node.
 - `test/inductor/test_torchinductor_opinfo.py` is automatically run in shard batches in file mode because one full-file pytest subprocess can be too large or crash before complete JUnit output is written.
 
@@ -180,7 +189,7 @@ pytest test/inductor/test_config.py::TestA::test_1 test/inductor/test_config.py:
 - Shard size is controlled by `--shard-size` (default: 100 tests).
 - Timeout is controlled by `--per-file-timeout` for each shard subprocess.
 - Per-test pytest-timeout is still enabled inside each shard via `--per-test-timeout`.
-- JUnit XML parsing, timeout recovery, `MISSED` handling, and checkpoints use the same behavior as file mode.
+- JUnit XML parsing, fresh-process failure/crash recovery, timeout recovery, `MISSED` handling, and checkpoints use the same behavior as file mode.
 - Use this mode when whole-file execution records many missed tests because a large file crashes or times out before complete results are available.
 
 ### Test mode: `--batch-mode test`
@@ -197,17 +206,22 @@ pytest --timeout 300 test/inductor/test_config.py::TestInductorConfig::test_set
 
 ## File And Shard Fallback Behavior
 
-`--batch-mode file` and `--batch-mode shard` are optimized for lower subprocess overhead, but they still try to keep the run moving when a test hangs.
+`--batch-mode file` and `--batch-mode shard` are optimized for lower subprocess overhead, but they still try to keep the run moving when a test fails, crashes, or hangs.
 
 - If a file subprocess passes, JUnit XML is parsed and each testcase is recorded as passed, skipped, failed, or error.
-- If a file subprocess returns a non-zero exit code but writes JUnit XML, the script records the individual failures/errors from XML. It does not rerun failures in test mode.
+- File and shard subprocesses use `-x`. After the configured in-process `--retry-attempts` are exhausted, pytest exits at the first persistent failure.
+- If the subprocess writes partial JUnit XML, completed results and the failed node are recovered from it.
+- Each subprocess also uses a unique `--sc` key for PyTorch's step-current plugin. If pytest crashes without complete JUnit XML, the runner uses step-current plus streamed verbose output to recover the active node and completed results.
+- The failed or crashed node is retried alone in a fresh pytest process.
+- If the isolated retry passes, the test is recorded as recovered/flaky. If it fails again, it is recorded as a consistent failure.
+- The unexecuted remainder of the file or shard then continues in another fresh pytest process.
 - If a file subprocess exceeds `--per-file-timeout`, the script parses verbose pytest output to identify the currently running pytest node, records that node as timed out, skips it, and restarts file-mode execution for the remaining nodes in that file.
 - If tests before the timed-out node cannot be recovered from JUnit XML or verbose pytest output, they are recorded as missed rather than error.
 - If the timed-out node cannot be identified, the next unresolved test in that file is recorded as missed and the script continues with the following node.
 - If four unidentified timeouts happen in a row in the same file, the remaining nodes in that file are recorded as missed to avoid repeatedly rerunning an unknown hang.
-- Checkpoints are written after file batches and timeout recovery so interrupted runs can continue from the next discovered test.
+- Checkpoints are written after file batches and recovery so interrupted runs can continue from the next discovered test.
 
-This gives file and shard mode most of the speed benefit of batched execution while recording individual failures and skipping timed-out tests so the rest of the file can continue.
+This gives file and shard mode most of the speed benefit of batched execution while adding process isolation after persistent failures and crashes. A fresh process clears process-owned Python, Inductor, Triton, and device runtime state before retrying or continuing.
 
 ## Rerun-Failed Mode
 
@@ -264,7 +278,7 @@ Each test is classified into exactly one state:
 | ERROR | Non-zero exit and `RuntimeError` appears in stdout or stderr. |
 | FAILED | Non-zero exit and no `RuntimeError` appears in output. |
 | TIMEDOUT | The test or fallback test hit its timeout. |
-| MISSED | File mode hit an outer timeout and could not identify the currently running test, so remaining nodes in that file were not run. |
+| MISSED | File or shard recovery could not reconstruct a completed node's result, or could not identify progress after a timeout/crash, so that node was not assigned a reliable final outcome. |
 
 ## Log File Format
 
