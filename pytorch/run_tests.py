@@ -4,6 +4,7 @@ Script to run PyTorch inductor unit tests from a CSV file.
 """
 
 import ast
+import copy
 import csv
 import io
 import json
@@ -627,17 +628,72 @@ def _record_file_batch_result(node_id, state, elapsed, log_file, index, total):
     }
 
 
+def _read_log_tail_from(log_file, start_offset, max_bytes=1_000_000):
+    """
+    Read at most max_bytes from log_file after start_offset.
+
+    File-batch pytest output is streamed directly to the log to avoid keeping
+    large verbose pytest output in memory. Timeout recovery only needs recent
+    output to identify the running node, so read a bounded tail from disk.
+    """
+    try:
+        log_file.flush()
+        path = getattr(log_file, "name", None)
+        if not path:
+            return ""
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end_offset = f.tell()
+            read_start = max(start_offset, end_offset - max_bytes)
+            f.seek(read_start)
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _new_stepcurrent_key():
+    """Return a unique key for PyTorch's pytest step-current plugin."""
+    return f"framework_scripts_{os.getpid()}_{time.time_ns()}"
+
+
+def _read_stepcurrent_node(pytorch_path, key):
+    """Return the node most recently started by pytest, if it was recorded."""
+    path = (
+        Path(pytorch_path)
+        / ".pytest_cache"
+        / "v"
+        / "cache"
+        / "stepcurrent"
+        / key
+        / "lastrun"
+    )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return value if isinstance(value, str) else None
+
+
 def _run_file_batch(file_name, node_ids, args, log_file):
     """
     Run one file (or a filtered set of nodes from one file) in one pytest process.
-    Returns (results, needs_fallback, elapsed).
+    Returns (results, reason, elapsed, problem_node).
     """
     env = _build_test_env()
     targets = node_ids
     with tempfile.TemporaryDirectory(prefix="run_tests_junit_") as tmpdir:
         junit_path = Path(tmpdir) / "pytest.xml"
-        cmd = ['pytest', '-vv', '--timeout', str(args.per_test_timeout)] + targets + [
-            '--junitxml', str(junit_path)
+        stepcurrent_key = _new_stepcurrent_key()
+        cmd = [
+            'pytest',
+            '-vv',
+            '-x',
+            '--timeout',
+            str(args.per_test_timeout),
+        ] + targets + [
+            '--junitxml',
+            str(junit_path),
+            f'--sc={stepcurrent_key}',
         ]
         if args.retry_attempts > 0:
             cmd.extend(['--reruns', str(args.retry_attempts)])
@@ -649,14 +705,15 @@ def _run_file_batch(file_name, node_ids, args, log_file):
         print(header, end='')
         log_file.write(header)
         log_file.flush()
+        output_start_offset = log_file.tell()
 
         start_time = time.time()
         try:
             result = subprocess.run(
                 cmd,
                 env=env,
-                capture_output=True,
-                text=True,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
                 cwd=str(args.pytorch_path),
                 timeout=args.per_file_timeout,
             )
@@ -666,25 +723,13 @@ def _run_file_batch(file_name, node_ids, args, log_file):
             msg = f"✗ FILE TIMEDOUT ({file_name}) after {elapsed:.2f}s (limit: {args.per_file_timeout}s)\n"
             print(msg, end='')
             log_file.write(msg)
-            try:
-                if e.stdout:
-                    log_file.write(e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout)
-                if e.stderr:
-                    log_file.write(e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr)
-            except (AttributeError, TypeError):
-                pass
             log_file.flush()
-            output = ""
-            try:
-                if e.stdout:
-                    output += e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout
-                if e.stderr:
-                    output += "\n"
-                    output += e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr
-            except (AttributeError, TypeError):
-                pass
+            output = _read_log_tail_from(log_file, output_start_offset)
             running_nodes = _running_nodes_from_output(output)
-            timed_out_node = running_nodes[-1] if running_nodes else None
+            timed_out_node = (
+                _read_stepcurrent_node(args.pytorch_path, stepcurrent_key)
+                or (running_nodes[-1] if running_nodes else None)
+            )
             partial_results, _, _, _ = _build_file_results(
                 node_ids, _parse_junit_testcases(junit_path),
                 file_name, log_file, elapsed, allow_partial=True
@@ -693,25 +738,48 @@ def _run_file_batch(file_name, node_ids, args, log_file):
                 partial_results = _parse_verbose_node_results(output)
             return partial_results, "timeout", elapsed, timed_out_node
 
-        if result.stdout:
-            log_file.write(result.stdout)
-        if result.stderr:
-            log_file.write(result.stderr)
         log_file.flush()
 
         testcase_states = _parse_junit_testcases(junit_path)
         if result.returncode != 0:
+            output = _read_log_tail_from(log_file, output_start_offset)
             if testcase_states:
                 msg = f"✗ FILE FAILED ({file_name}) with exit code {result.returncode} ({elapsed:.2f}s)\n"
                 print(msg, end='')
                 log_file.write(msg)
                 log_file.flush()
-                return _build_file_results(node_ids, testcase_states, file_name, log_file, elapsed)
+                partial_results, _, _, _ = _build_file_results(
+                    node_ids,
+                    testcase_states,
+                    file_name,
+                    log_file,
+                    elapsed,
+                    allow_partial=True,
+                )
+                failed_node = next(
+                    (
+                        item['name']
+                        for item in reversed(partial_results)
+                        if not item['success']
+                    ),
+                    None,
+                )
+                failed_node = failed_node or _read_stepcurrent_node(
+                    args.pytorch_path, stepcurrent_key
+                )
+                return partial_results, "failure", elapsed, failed_node
             msg = f"✗ FILE FAILED ({file_name}) with exit code {result.returncode} ({elapsed:.2f}s); no JUnit results available.\n"
             print(msg, end='')
             log_file.write(msg)
             log_file.flush()
-            return [], "failed_no_results", elapsed, None
+            partial_results = _parse_verbose_node_results(output)
+            failed_node = _read_stepcurrent_node(
+                args.pytorch_path, stepcurrent_key
+            )
+            if failed_node is None:
+                running_nodes = _running_nodes_from_output(output)
+                failed_node = running_nodes[-1] if running_nodes else None
+            return partial_results, "crash", elapsed, failed_node
 
         return _build_file_results(node_ids, testcase_states, file_name, log_file, elapsed)
 
@@ -1348,9 +1416,94 @@ def _run_file_node_group(file_name, node_ids, args, log_file, mode, test_names, 
     unknown_timeout_misses = 0
     file_done = False
     while remaining_nodes and not file_done:
-        file_results, reason, elapsed, timed_out_node = _run_file_batch(
+        file_results, reason, elapsed, problem_node = _run_file_batch(
             file_name, remaining_nodes, args, log_file
         )
+
+        if (
+            reason in ("failure", "crash")
+            and problem_node in remaining_nodes
+        ):
+            problem_position = remaining_nodes.index(problem_node)
+            result_by_name = {item['name']: item for item in file_results}
+
+            # Record every node completed before the process-ending failure.
+            for completed_node in remaining_nodes[:problem_position]:
+                item = result_by_name.get(completed_node)
+                state = item['state'] if item else STATE_MISSED
+                test_elapsed = item['time'] if item else 0.0
+                node_index += 1
+                recorded = _record_file_batch_result(
+                    completed_node,
+                    state,
+                    test_elapsed,
+                    log_file,
+                    node_index,
+                    len(test_names),
+                )
+                results.append(recorded)
+
+            msg = (
+                f"Restarting failed test in a fresh pytest process: "
+                f"{problem_node}\n"
+            )
+            print(msg, end='')
+            log_file.write(msg)
+            log_file.flush()
+
+            retry_results, _retry_reason, retry_elapsed, _ = _run_file_batch(
+                file_name, [problem_node], args, log_file
+            )
+            retry_item = next(
+                (
+                    item
+                    for item in retry_results
+                    if item['name'] == problem_node
+                ),
+                None,
+            )
+            original_item = result_by_name.get(problem_node)
+            if retry_item is not None:
+                final_state = retry_item['state']
+                final_elapsed = retry_item['time']
+            elif original_item is not None:
+                final_state = original_item['state']
+                final_elapsed = original_item['time']
+            else:
+                final_state = STATE_ERROR
+                final_elapsed = retry_elapsed
+
+            node_index += 1
+            recorded = _record_file_batch_result(
+                problem_node,
+                final_state,
+                final_elapsed,
+                log_file,
+                node_index,
+                len(test_names),
+            )
+            if (
+                retry_item is not None
+                and retry_item['success']
+                and (original_item is None or not original_item['success'])
+            ):
+                recorded['attempts'] = 2
+                recorded['flaky'] = True
+                recorded['consistent_failure'] = False
+                msg = (
+                    f"Recovered in a fresh pytest process: {problem_node}\n"
+                )
+                print(msg, end='')
+                log_file.write(msg)
+                log_file.flush()
+            results.append(recorded)
+
+            remaining_nodes = remaining_nodes[problem_position + 1:]
+            unknown_timeout_misses = 0
+            if args.stop_on_failure and not recorded['success']:
+                file_done = True
+            continue
+
         recorded_names = set()
         for result in file_results:
             node_index += 1
@@ -1364,8 +1517,8 @@ def _run_file_node_group(file_name, node_ids, args, log_file, mode, test_names, 
         if reason is None:
             file_done = True
             continue
-        if reason == "timeout" and timed_out_node and timed_out_node in remaining_nodes:
-            timeout_position = remaining_nodes.index(timed_out_node)
+        if reason == "timeout" and problem_node and problem_node in remaining_nodes:
+            timeout_position = remaining_nodes.index(problem_node)
             for node_id in remaining_nodes[:timeout_position]:
                 if node_id in recorded_names:
                     continue
@@ -1375,20 +1528,20 @@ def _run_file_node_group(file_name, node_ids, args, log_file, mode, test_names, 
                 )
                 results.append(recorded)
 
-            if timed_out_node not in recorded_names:
+            if problem_node not in recorded_names:
                 node_index += 1
                 recorded = _record_file_batch_result(
-                    timed_out_node, STATE_TIMEDOUT, elapsed, log_file, node_index, len(test_names)
+                    problem_node, STATE_TIMEDOUT, elapsed, log_file, node_index, len(test_names)
                 )
                 results.append(recorded)
             else:
                 for result in reversed(results):
-                    if result['name'] == timed_out_node:
+                    if result['name'] == problem_node:
                         result['state'] = STATE_TIMEDOUT
                         result['success'] = False
                         result['timed_out'] = True
                         break
-            msg = f"Skipping timed-out test and continuing: {timed_out_node}\n"
+            msg = f"Skipping timed-out test and continuing: {problem_node}\n"
             print(msg, end='')
             log_file.write(msg)
             log_file.flush()
