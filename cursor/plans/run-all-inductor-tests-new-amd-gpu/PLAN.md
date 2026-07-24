@@ -90,6 +90,36 @@ test execution, and maintain rolling progress in
    failed/error/timed-out/missed tests, resume information, tmux session, and
    local artifact paths.
 
+## Final GitHub issue description
+
+After the complete run and any planned reruns finish, replace the description
+of [framework_scripts issue #5](https://github.com/naromero77amd/framework_scripts/issues/5)
+with a durable report modeled on
+[ROCm/frameworks-internal issue #17237](https://github.com/ROCm/frameworks-internal/issues/17237#issue-4850446855):
+
+1. Add an `inductor-suite-summary` section, delimited by HTML comments, with one
+   row per Inductor test file and a final total row. Include total, passed,
+   skipped, xfailed, failed, error, timed out, missed, and total recorded time.
+2. Add a `repro-instructions` section containing the exact container/workspace
+   setup, PyTorch/Triton/ROCm versions and commits, GPU architecture, runner
+   commit, any uncommitted runner diff used by this run, environment overrides,
+   and the exact test command.
+3. Add an `inductor-suite-notes` section that explains the interpretation of
+   pre-existing failures, all reruns or interrupted work, the causes of
+   `MISSED` entries, and common failure patterns grouped by suite and signature.
+   Distinguish correctness failures, unsupported `gfx1250` behavior,
+   crashes/signals, timeouts, and test-infrastructure failures.
+4. Add the note that issue comments below the description are intermediate
+   Cursor checkpoints and can be ignored.
+5. Generate the report from the completed log, checkpoint, analysis, and any
+   rerun artifacts. Deduplicate tests by pytest node ID and let the latest rerun
+   result override an earlier result. Confirm every discovered test is
+   represented exactly once or explicitly classified as missed.
+6. Update the issue description, not a comment, using `gh issue edit --body-file`
+   or the GitHub API. Preserve any content outside generated HTML markers, avoid
+   secrets and unrestricted raw logs, then read the issue back to verify the
+   published body and totals.
+
 ## Execution checklist
 
 - [ ] Plan committed and pushed.
@@ -99,3 +129,4 @@ test execution, and maintain rolling progress in
 - [ ] Ten-minute ETA reported.
 - [ ] Thirty-minute rolling checkpoints active.
 - [ ] Final summary and artifact paths reported.
+- [ ] Final suite report published and verified in the issue description.
