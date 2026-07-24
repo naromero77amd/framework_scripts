@@ -90,10 +90,35 @@ test execution, and maintain rolling progress in
    failed/error/timed-out/missed tests, resume information, tmux session, and
    local artifact paths.
 
+## Mandatory missed-test rerun
+
+1. Let the complete primary suite finish. Then parse its log and checkpoint,
+   extract every test whose final state is `MISSED`, and deduplicate the list by
+   exact pytest node ID. These are attribution gaps from interrupted file
+   batches, not confirmed test failures.
+2. Rerun only those node IDs in file-scoped shards of at most `50` tests. Use
+   the existing runner's full-suite shard path by grouping missed IDs by source
+   file and invoking the runner with `--all-tests`, `-i <file>`,
+   `--regex <anchored-exact-node-regex>`, `--batch-mode shard`, and
+   `--shard-size 50`. Split very large exact-node regexes into
+   multiple invocations if necessary to remain below command-line limits.
+3. Do not use `--rerun-failed` for this step: the current runner does not select
+   `MISSED` entries in that mode, and rerun mode ignores shard batching.
+4. Keep separate timestamped rerun logs, checkpoints, metadata, and analyses.
+   Preserve the original GPU visibility, environment, retry count, and timeout
+   settings.
+5. If a shard rerun still produces missed nodes, repeat the shard-size-50 pass
+   for the remaining exact node IDs until no misses remain or a complete round
+   makes no progress. If no progress is possible, stop the rerun loop and
+   clearly report the unresolved nodes and their crash/process signatures.
+6. Merge rerun outcomes over the primary results by exact node ID, with the
+   latest completed rerun result taking precedence. Do not publish the final
+   suite totals or issue description until this merge is complete.
+
 ## Final GitHub issue description
 
-After the complete run and any planned reruns finish, replace the description
-of [framework_scripts issue #5](https://github.com/naromero77amd/framework_scripts/issues/5)
+After the complete run and mandatory missed-test reruns finish, replace the
+description of [framework_scripts issue #5](https://github.com/naromero77amd/framework_scripts/issues/5)
 with a durable report modeled on
 [ROCm/frameworks-internal issue #17237](https://github.com/ROCm/frameworks-internal/issues/17237#issue-4850446855):
 
@@ -128,5 +153,6 @@ with a durable report modeled on
 - [ ] Full Inductor suite running in tmux.
 - [ ] Ten-minute ETA reported.
 - [ ] Thirty-minute rolling checkpoints active.
+- [ ] All missed tests rerun in shards of 50 and merged into final results.
 - [ ] Final summary and artifact paths reported.
 - [ ] Final suite report published and verified in the issue description.
