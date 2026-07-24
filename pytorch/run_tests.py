@@ -14,6 +14,7 @@ import re
 import signal
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 import traceback
@@ -35,6 +36,10 @@ TRITON_NIGHTLY_INDUCTOR_FILES = [
 ]
 
 _TORCH_VERSION_CACHE = None
+_TORCH_HIP_VERSION_CACHE = None
+_THE_ROCK_DEVEL_PATH = str(
+    Path(sysconfig.get_path('purelib')) / '_rocm_sdk_devel'
+)
 
 
 def _require_rocm_home():
@@ -85,6 +90,48 @@ def _torch_version_is_before_2_13():
     return (major, minor) < (2, 13)
 
 
+def _installed_torch_hip_version():
+    """Return torch.version.hip from the installed PyTorch package."""
+    global _TORCH_HIP_VERSION_CACHE
+    if _TORCH_HIP_VERSION_CACHE is not None:
+        return _TORCH_HIP_VERSION_CACHE
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            'import torch; print(torch.version.hip or "")',
+        ],
+        cwd='/tmp',
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if result.returncode != 0:
+        _TORCH_HIP_VERSION_CACHE = ''
+    else:
+        lines = (result.stdout or '').strip().splitlines()
+        _TORCH_HIP_VERSION_CACHE = lines[-1] if lines else ''
+    return _TORCH_HIP_VERSION_CACHE
+
+
+def _uses_the_rock_sdk():
+    """Return True when torch.version.hip identifies a post-7.2 TheRock build."""
+    version = _installed_torch_hip_version()
+    match = re.match(r'^(\d+)\.(\d+)', version)
+    if not match:
+        return False
+    major, minor = (int(match.group(1)), int(match.group(2)))
+    return (major, minor) > (7, 2)
+
+
+def _test_rocm_home():
+    """Return the ROCm root that Inductor test subprocesses should use."""
+    if _uses_the_rock_sdk():
+        return _THE_ROCK_DEVEL_PATH
+    return _require_rocm_home()
+
+
 def _build_test_env():
     """Build subprocess environment for inductor tests."""
     env = {
@@ -94,7 +141,7 @@ def _build_test_env():
         'HSA_TOOLS_DISABLE_REGISTER': '1',
         'PYTORCH_TESTING_DEVICE_ONLY_FOR': 'cuda',
     }
-    env['ROCM_HOME'] = _require_rocm_home()
+    env['ROCM_HOME'] = _test_rocm_home()
     if _torch_version_is_before_2_13():
         env['TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER'] = '0'
     return env
@@ -2355,9 +2402,9 @@ def main():
         print("Error: --resume is not supported with --num-gpus > 1 yet. Start a fresh full-suite run.")
         sys.exit(1)
 
-    # Inductor ROCm tests require ROCM_HOME to be set in the user environment.
+    # Resolve ROCM_HOME early so configuration errors are reported before discovery.
     try:
-        _require_rocm_home()
+        _test_rocm_home()
     except RuntimeError as e:
         print(f"Error: {e}")
         print("Example: export ROCM_HOME=/opt/rocm")
