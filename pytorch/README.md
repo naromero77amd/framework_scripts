@@ -12,6 +12,7 @@ Full-suite mode defaults to `test/inductor/test_torchinductor.py` and runs one p
 
 - **PyTorch path**: Pass the PyTorch checkout root with `--pytorch-path`.
 - The script sets `PYTORCH_TEST_WITH_ROCM=1`, `HSA_FORCE_FINE_GRAIN_PCIE=1`, and `PYTORCH_TESTING_DEVICE_ONLY_FOR=cuda` when invoking tests.
+- `--include-inductor-wrapped-tests` additionally sets `PYTORCH_TEST_WITH_INDUCTOR=1`, matching PyTorch's `run_test.py --inductor` behavior.
 - **pytest, pytest-timeout, pytest-rerunfailures, and expecttest**: The script checks these imports and aborts with a clear message if any are missing. Install with `pip install pytest pytest-timeout pytest-rerunfailures expecttest`.
 - Timeout behavior depends on execution strategy:
   - `--per-test-timeout` is passed to pytest-timeout and is a per-test timeout.
@@ -87,6 +88,13 @@ Full-suite mode starts from a list of files under `PYTORCH_PATH/test/`.
 - **Default**: Without `-i` or a shortcut, the script uses `test/inductor/test_torchinductor.py`.
 - **Explicit files**: Use `-i FILE [FILE ...]` to provide files relative to `test/`, such as `-i test_ops.py inductor/test_config.py`.
 - **Inductor all shortcut**: `--include-inductor-all-tests` adds every test file under `PYTORCH_PATH/test/inductor` that is registered in PyTorch's `tools/testing/discover_tests.py`. It implies `--all-tests` and appends those files to any files passed with `-i`, de-duplicating the final list.
+- **Inductor-wrapped shortcut**: `--include-inductor-wrapped-tests` reproduces the `--inductor` portion of PyTorch's `TEST_CONFIG=inductor`:
+  - `test_modules.py`
+  - `test_ops.py`
+  - `test_ops_gradients.py`
+  - `test_torch.py`
+
+  It implies `--all-tests` and runs collection and execution with `PYTORCH_TEST_WITH_INDUCTOR=1`. It cannot be combined with `-i`, `--include-inductor-all-tests`, or `--include-triton-nightly-inductor-tests`, because that environment applies to the entire process and native Inductor tests must not be wrapped again.
 - **Triton nightly Inductor shortcut**: `--include-triton-nightly-inductor-tests` adds the seven files used by ROCm's `pytorch-ci-scripts/torch-triton-nightly/inductor-tests.py`:
   - `inductor/test_torchinductor.py`
   - `inductor/test_flex_attention.py`
@@ -312,6 +320,7 @@ Each test is classified into exactly one state:
 | `csv_file` | CSV mode | Path to CSV with a `test_name` column containing full pytest node IDs. Omit when using `--all-tests` or `--rerun-failed`. |
 | `--all-tests` | Full-suite mode | Discover and run tests in the configured full-suite file list. |
 | `--include-inductor-all-tests` | Full-suite mode | Add every registered PyTorch `test/inductor` test file from `--pytorch-path`; implies `--all-tests`. |
+| `--include-inductor-wrapped-tests` | Full-suite mode | Run the four suites from PyTorch's `--inductor` CI pass with `PYTORCH_TEST_WITH_INDUCTOR=1`; implies `--all-tests`. |
 | `--include-triton-nightly-inductor-tests` | Full-suite mode | Add ROCm torch-triton-nightly Inductor validation files; implies `--all-tests`. |
 | `--rerun-failed LOG_FILE` | Rerun-failed mode | Rerun failed tests from a previous text log. |
 | `--rerun-include-timeouts` | Rerun-failed mode | Also rerun timed-out tests from the previous log. |
@@ -359,6 +368,9 @@ python run_tests.py --all-tests -i test_ops.py inductor/test_config.py --pytorch
 
 # Run every registered PyTorch test/inductor file
 python run_tests.py --include-inductor-all-tests --pytorch-path /path/to/pytorch
+
+# Run the ordinary PyTorch suites wrapped by --inductor in CI
+python run_tests.py --include-inductor-wrapped-tests --pytorch-path /path/to/pytorch
 
 # Run the ROCm torch-triton-nightly Inductor validation subset
 python run_tests.py --include-triton-nightly-inductor-tests --pytorch-path /path/to/pytorch

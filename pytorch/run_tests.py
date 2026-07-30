@@ -25,6 +25,14 @@ import xml.etree.ElementTree as ET
 
 # Relative path to the test file (under PyTorch root); used in run_test, discover_tests, main
 TEST_FILE_REL_PATH = 'test/inductor/test_torchinductor.py'
+# Keep in sync with test_inductor_shard() in PyTorch's .ci/pytorch/test.sh.
+# These are the suites invoked through test/run_test.py --inductor.
+INDUCTOR_WRAPPED_TEST_FILES = [
+    'test_modules.py',
+    'test_ops.py',
+    'test_ops_gradients.py',
+    'test_torch.py',
+]
 TRITON_NIGHTLY_INDUCTOR_FILES = [
     'inductor/test_torchinductor.py',
     'inductor/test_flex_attention.py',
@@ -1254,6 +1262,11 @@ def discover_inductor_all_files(pytorch_path):
     return files
 
 
+def inductor_wrapped_test_files():
+    """Return the files wrapped by --inductor in PyTorch's inductor CI config."""
+    return INDUCTOR_WRAPPED_TEST_FILES[:]
+
+
 def discover_inductor_core_files(pytorch_path):
     """Backward-compatible alias for the all-Inductor suite selector."""
     return discover_inductor_all_files(pytorch_path)
@@ -2319,6 +2332,15 @@ def main():
         help='Add every PyTorch test/inductor test file from PYTORCH_PATH; implies --all-tests'
     )
     parser.add_argument(
+        '--include-inductor-wrapped-tests',
+        action='store_true',
+        help=(
+            'Run the four suites wrapped by --inductor in PyTorch '
+            'TEST_CONFIG=inductor; implies --all-tests and enables '
+            'PYTORCH_TEST_WITH_INDUCTOR=1'
+        )
+    )
+    parser.add_argument(
         '--include-triton-nightly-inductor-tests',
         action='store_true',
         help='Add the ROCm torch-triton-nightly Inductor validation test files; implies --all-tests'
@@ -2428,6 +2450,30 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.include_inductor_wrapped_tests:
+        if (
+            args.input_files
+            or args.include_inductor_all_tests
+            or args.include_triton_nightly_inductor_tests
+        ):
+            print(
+                "Error: --include-inductor-wrapped-tests cannot be combined with "
+                "-i/--input-files, --include-inductor-all-tests, or "
+                "--include-triton-nightly-inductor-tests. The Inductor environment "
+                "applies process-wide."
+            )
+            sys.exit(1)
+
+        args.all_tests = True
+        args.input_files = inductor_wrapped_test_files()
+        # _build_test_env() copies os.environ for discovery, regular execution,
+        # recovery subprocesses, and multi-GPU workers.
+        os.environ['PYTORCH_TEST_WITH_INDUCTOR'] = '1'
+        print(
+            f"Added {len(args.input_files)} PyTorch Inductor-wrapped test file(s); "
+            "enabled PYTORCH_TEST_WITH_INDUCTOR=1."
+        )
 
     if args.include_inductor_all_tests:
         args.all_tests = True
