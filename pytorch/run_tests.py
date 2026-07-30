@@ -200,6 +200,8 @@ BATCH_MODE_SHARD = "shard"
 BATCH_MODE_TEST = "test"
 DEFAULT_SHARDED_FILE_SUFFIXES = ("test/inductor/test_torchinductor_opinfo.py",)
 UNKNOWN_TIMEOUT_MISS_LIMIT = 4
+RESULT_JOURNAL_ENV = "FRAMEWORK_SCRIPTS_RESULT_JOURNAL"
+RESULT_JOURNAL_PLUGIN = "pytest_result_journal"
 
 
 def _now_iso():
@@ -638,6 +640,74 @@ def _parse_verbose_node_results(output: str):
     return results
 
 
+def _parse_result_journal(journal_path):
+    """
+    Parse completed node results and the active node from a JSONL journal.
+
+    A malformed final line is ignored because the pytest process may have
+    crashed during its write. Later finish records replace earlier attempts.
+    """
+    path = Path(journal_path)
+    results_by_name = {}
+    active_node = None
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return [], None
+
+    valid_states = {
+        STATE_PASSED,
+        STATE_SKIPPED,
+        STATE_XFAILED,
+        STATE_ERROR,
+        STATE_FAILED,
+    }
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        node_id = event.get("nodeid")
+        if not isinstance(node_id, str) or not node_id:
+            continue
+        if event.get("event") == "start":
+            active_node = node_id
+            continue
+        if event.get("event") != "finish":
+            continue
+        state = event.get("state")
+        if state not in valid_states:
+            continue
+        try:
+            elapsed = float(event.get("duration", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            elapsed = 0.0
+        results_by_name[node_id] = {
+            'name': node_id,
+            'success': _is_success_state(state),
+            'time': elapsed,
+            'timed_out': False,
+            'state': state,
+        }
+        if active_node == node_id:
+            active_node = None
+    return list(results_by_name.values()), active_node
+
+
+def _merge_partial_results(node_ids, *result_sets):
+    """Merge partial result sets in node order; later sets take precedence."""
+    allowed_names = set(node_ids)
+    by_name = {}
+    for results in result_sets:
+        for result in results:
+            name = result.get('name')
+            if name in allowed_names:
+                by_name[name] = result
+    return [by_name[node_id] for node_id in node_ids if node_id in by_name]
+
+
 def _write_result_status(log_file, state, elapsed):
     status_map = {
         STATE_PASSED: "✓ PASSED",
@@ -730,9 +800,19 @@ def _run_file_batch(file_name, node_ids, args, log_file):
     targets = node_ids
     with tempfile.TemporaryDirectory(prefix="run_tests_junit_") as tmpdir:
         junit_path = Path(tmpdir) / "pytest.xml"
+        journal_path = Path(tmpdir) / "results.jsonl"
+        env[RESULT_JOURNAL_ENV] = str(journal_path)
+        plugin_path = str(Path(__file__).resolve().parent)
+        existing_pythonpath = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = (
+            plugin_path
+            + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+        )
         stepcurrent_key = _new_stepcurrent_key()
         cmd = [
             'pytest',
+            '-p',
+            RESULT_JOURNAL_PLUGIN,
             '-vv',
             '-x',
             '--timeout',
@@ -772,22 +852,33 @@ def _run_file_batch(file_name, node_ids, args, log_file):
             log_file.write(msg)
             log_file.flush()
             output = _read_log_tail_from(log_file, output_start_offset)
+            journal_results, journal_active_node = _parse_result_journal(
+                journal_path
+            )
             running_nodes = _running_nodes_from_output(output)
             timed_out_node = (
                 _read_stepcurrent_node(args.pytorch_path, stepcurrent_key)
+                or journal_active_node
                 or (running_nodes[-1] if running_nodes else None)
             )
-            partial_results, _, _, _ = _build_file_results(
+            junit_results, _, _, _ = _build_file_results(
                 node_ids, _parse_junit_testcases(junit_path),
                 file_name, log_file, elapsed, allow_partial=True
             )
-            if not partial_results:
-                partial_results = _parse_verbose_node_results(output)
+            partial_results = _merge_partial_results(
+                node_ids,
+                _parse_verbose_node_results(output),
+                junit_results,
+                journal_results,
+            )
             return partial_results, "timeout", elapsed, timed_out_node
 
         log_file.flush()
 
         testcase_states = _parse_junit_testcases(junit_path)
+        journal_results, journal_active_node = _parse_result_journal(
+            journal_path
+        )
         if result.returncode != 0:
             output = _read_log_tail_from(log_file, output_start_offset)
             if testcase_states:
@@ -795,13 +886,18 @@ def _run_file_batch(file_name, node_ids, args, log_file):
                 print(msg, end='')
                 log_file.write(msg)
                 log_file.flush()
-                partial_results, _, _, _ = _build_file_results(
+                junit_results, _, _, _ = _build_file_results(
                     node_ids,
                     testcase_states,
                     file_name,
                     log_file,
                     elapsed,
                     allow_partial=True,
+                )
+                partial_results = _merge_partial_results(
+                    node_ids,
+                    junit_results,
+                    journal_results,
                 )
                 failed_node = next(
                     (
@@ -813,16 +909,20 @@ def _run_file_batch(file_name, node_ids, args, log_file):
                 )
                 failed_node = failed_node or _read_stepcurrent_node(
                     args.pytorch_path, stepcurrent_key
-                )
+                ) or journal_active_node
                 return partial_results, "failure", elapsed, failed_node
             msg = f"✗ FILE FAILED ({file_name}) with exit code {result.returncode} ({elapsed:.2f}s); no JUnit results available.\n"
             print(msg, end='')
             log_file.write(msg)
             log_file.flush()
-            partial_results = _parse_verbose_node_results(output)
+            partial_results = _merge_partial_results(
+                node_ids,
+                _parse_verbose_node_results(output),
+                journal_results,
+            )
             failed_node = _read_stepcurrent_node(
                 args.pytorch_path, stepcurrent_key
-            )
+            ) or journal_active_node
             if failed_node is None:
                 running_nodes = _running_nodes_from_output(output)
                 failed_node = running_nodes[-1] if running_nodes else None
