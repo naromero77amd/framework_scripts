@@ -90,6 +90,24 @@ test execution, and maintain rolling progress in
    failed/error/timed-out/missed tests, resume information, tmux session, and
    local artifact paths.
 
+## Known hard-hang exclusion
+
+- Never rerun
+  `test/inductor/test_mix_order_reduction.py::MixOrderReductionTest::test_layer_norm_bwd_with_dynamic_shape_dynamic_dims2`
+  on this `gfx1250` system. On 2026-07-29 it wedged the GPU/kernel path; neither
+  `SIGTERM` nor `SIGKILL` could terminate the pytest process or its D-state
+  worker.
+- Never rerun
+  `test/inductor/test_flex_attention.py::TestFlexAttentionCUDA::test_builtin_score_mods_different_block_size_score_mod6_BLOCK_SIZE3_cuda_float16`
+  on this system. It was active when the GPU disappeared and required a host
+  driver reload on 2026-07-30.
+- Apply the exclusion to primary-run resumes and missed-test reruns with
+  `PYTEST_ADDOPTS=--deselect=<node-id>` (preserving any existing
+  `PYTEST_ADDOPTS`). Record the node as an intentional unresolved exclusion in
+  the final report, not as a test to retry.
+- The run-local exclusion manifest is
+  `/workspace/pytorch/inductor_all_gfx1250_20260724_210412.skip_nodes.txt`.
+
 ## Mandatory missed-test rerun
 
 1. Let the complete primary suite finish. Then parse its log and checkpoint,
@@ -114,6 +132,8 @@ test execution, and maintain rolling progress in
 6. Merge rerun outcomes over the primary results by exact node ID, with the
    latest completed rerun result taking precedence. Do not publish the final
    suite totals or issue description until this merge is complete.
+7. Remove every node in the known hard-hang exclusion manifest from all rerun
+   rounds.
 
 ## Final GitHub issue description
 
