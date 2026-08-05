@@ -62,7 +62,7 @@ test execution, and maintain rolling progress in
   status directly under `/workspace/pytorch`, allowing
   `framework_scripts/pytorch/analyze_inductor_run.py` to resolve the checkout.
 - Record individual failures and continue the suite. Only infrastructure or
-  preflight failures stop the run.
+  preflight failures and the mandatory safety conditions below stop the run.
 
 ## Test count, ETA, and progress
 
@@ -89,6 +89,92 @@ test execution, and maintain rolling progress in
    terminal and GitHub update. Include final counts, duration, exit code,
    failed/error/timed-out/missed tests, resume information, tmux session, and
    local artifact paths.
+
+## Safety monitoring and mandatory stop policy
+
+Run a dedicated safety monitor beside every full-suite or targeted runner. The
+runner must start in its own process group with `setsid`; the monitor remains
+outside that group so it can terminate the complete runner/pytest/compile-worker
+tree. The wrapper must treat a nonzero monitor exit as a mandatory stop, record
+runner exit `5`, and require GPU-health investigation before continuation.
+
+### Log and state handling
+
+1. Tail only bytes appended after the current launch offset. On resume, record
+   the existing log size before starting the runner so old crash text cannot
+   retrigger a stop.
+2. Track the active pytest node from the verbose log, but update adjacency only
+   from the runner's final per-node result records (`Running: <node>` followed
+   by passed, skipped, xfailed, failed, error, timed-out, or missed status).
+3. Persist monitor state atomically after every detected event and completed
+   result. Keep the policy version, current adjacent-SIGABRT nodes, pending
+   SIGABRT nodes, current adjacent-timeout nodes, pending timeout nodes, event
+   history, and last completed test. Use one state file across suite boundaries
+   because a wrapper boundary is not an executed test.
+4. Write a separate mandatory-stop JSON artifact containing the reason,
+   triggering detail, configured limits, current nodes, log path, and runner
+   PID. Preserve it with the runner log and checkpoint.
+5. Ignore configuration/header text when matching errors. In particular, do
+   not treat a line beginning `Stop message after current shard:` as an
+   invalid-device failure merely because it quotes the configured stop text.
+
+### Five-adjacent-test SIGABRT rule
+
+1. Detect SIGABRT from `Fatal Python error: Aborted` or process exit code `-6`
+   and associate it with the active logical pytest node.
+2. An initial batch crash and all fresh-process retry aborts for the same node
+   count as one test, not multiple adjacent tests. Mark the node as pending
+   when the signal is seen and add it to the streak only when the runner emits
+   that node's final result.
+3. A node counts as a SIGABRT test if any of its attempts emitted SIGABRT, even
+   if a fresh-process retry later produced a terminal result.
+4. Increment the streak only when the next completed logical test is a
+   SIGABRT-producing test. Any intervening completed test without SIGABRT
+   resets the streak to zero, regardless of whether its outcome is passed,
+   skipped, xfailed, normally failed, error, timed out, or missed.
+5. Stop immediately when the fifth adjacent executed test is finalized as a
+   SIGABRT-producing test. This is not a cumulative count across the run.
+   Version/reset state created by older event-based policies so their counts
+   cannot carry into this adjacency rule.
+
+### Three-adjacent-test timeout rule
+
+1. Detect timeout-producing tests from the runner's file/test timeout markers
+   and associate each marker with the active logical pytest node.
+2. Treat repeated timeout markers and fresh-process retries for one node as one
+   timeout-producing test. Mark the node pending when detected and add it to
+   the timeout streak only when its final per-node result is emitted.
+3. Increment the timeout streak only when the next completed logical test
+   produced a timeout. Any intervening completed non-timeout test resets the
+   timeout streak to zero, regardless of its terminal outcome.
+4. Stop immediately when the third adjacent executed test is finalized as a
+   timeout-producing test. This is not a cumulative distinct-node count across
+   the run. Version/reset timeout state created by the older event-based policy
+   so it cannot carry into this adjacency rule.
+
+### Other mandatory stops
+
+- Stop immediately on `CUDA error: invalid device function` or
+  `hipErrorInvalidDeviceFunction`.
+- Poll relevant runner, pytest, and compile processes for uninterruptible
+  `D` state. Stop if a matching process remains in `D` state for 60 seconds.
+- Check AMD GPU visibility at least every 30 seconds, with a bounded command
+  timeout. Stop if `amd-smi list --json` fails or reports no GPU.
+- If the monitor itself fails, the wrapper must stop instead of allowing an
+  unmonitored test run to continue.
+
+### Stop and recovery procedure
+
+1. On a mandatory stop, atomically write the stop artifact, send `SIGTERM` to
+   the runner process group, wait up to five seconds, then send `SIGKILL` to
+   the same group if it still exists.
+2. Confirm no runner, pytest, or compile-worker process survived. Inspect
+   `/dev/kfd` and the selected render node for users and verify that AMD tooling
+   still sees the selected GPU.
+3. Run the same tensor-add correctness smoke test used in preflight. Do not
+   resume unless the GPU is visible, idle, and the smoke test passes.
+4. Resume from the persisted runner checkpoint/state and a new log offset;
+   never discard already committed per-node outcomes.
 
 ## Known hard-hang exclusion
 
@@ -173,6 +259,9 @@ with a durable report modeled on
 - [ ] Full Inductor suite running in tmux.
 - [ ] Ten-minute ETA reported.
 - [ ] Thirty-minute rolling checkpoints active.
+- [ ] Dedicated safety monitor active with five-adjacent-SIGABRT and
+      three-adjacent-timeout policies.
+- [ ] Mandatory-stop state and post-stop GPU-health procedure verified.
 - [ ] All missed tests rerun in shards of 50 and merged into final results.
 - [ ] Final summary and artifact paths reported.
 - [ ] Final suite report published and verified in the issue description.
