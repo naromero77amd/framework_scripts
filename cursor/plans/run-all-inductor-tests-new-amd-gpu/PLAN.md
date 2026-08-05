@@ -5,8 +5,7 @@
 Run every registered PyTorch Inductor unit test from `/workspace/pytorch` on an
 idle AMD GPU. Keep the run resilient in tmux, report the collected test total
 as soon as discovery finishes, publish a preliminary ETA after ten minutes of
-test execution, and maintain rolling progress in
-[framework_scripts issue #5](https://github.com/naromero77amd/framework_scripts/issues/5).
+test execution, and maintain rolling progress in framework_scripts issue #5.
 
 ## Fail-closed preflight
 
@@ -224,32 +223,55 @@ runner exit `5`, and require GPU-health investigation before continuation.
 ## Final GitHub issue description
 
 After the complete run and mandatory missed-test reruns finish, replace the
-description of [framework_scripts issue #5](https://github.com/naromero77amd/framework_scripts/issues/5)
-with a durable report modeled on
+description of framework_scripts issue #5 with a durable report modeled on
 [ROCm/frameworks-internal issue #17237](https://github.com/ROCm/frameworks-internal/issues/17237#issue-4850446855):
 
-1. Add an `inductor-suite-summary` section, delimited by HTML comments, with one
+1. Start with a dated outcome heading and a prominent completeness statement.
+   If any planned run or targeted rerun is unfinished, label the report as the
+   latest merged outcome rather than a fully completed final run, and show
+   completed, planned, and pending execution counts.
+2. Add an overall result block containing:
+   - the discovered exact-node total;
+   - the explicit `PASSED` count;
+   - pass rate, defined as
+     `(passed + skipped + xfailed) / total`;
+   - failing outcomes and failing rate, defined as
+     `(failed + error + missed) / total`; and
+   - the exact-node merge rule.
+   The pass and failing rates must reconcile to 100% when timed-out results are
+   zero. If timed-out is nonzero, classify it explicitly and state which side
+   of the rate calculation includes it.
+3. Add an `inductor-suite-summary` section, delimited by HTML comments, with one
    row per Inductor test file and a final total row. Include total, passed,
-   skipped, xfailed, failed, error, timed out, missed, and total recorded time.
-2. Add a `repro-instructions` section containing the exact container/workspace
+   skipped, xfailed, failed, error, timed out, and missed. Include total
+   recorded time when it is comparable across all merged sources; otherwise
+   state why timing is omitted rather than fabricating it.
+4. Add execution and merge notes with full-suite and targeted-rerun coverage,
+   pending counts, runtime/ROCm provenance, and the rule that pending reruns
+   retain their earlier terminal state in the merged table.
+5. Document the final stop reason and any correction to stop-counter semantics,
+   post-stop process/GPU health, important high-risk test outcomes, and the
+   largest unresolved failure, error, and missed clusters.
+6. Add a `repro-instructions` section containing the exact container/workspace
    setup, PyTorch/Triton/ROCm versions and commits, GPU architecture, runner
    commit, any uncommitted runner diff used by this run, environment overrides,
    and the exact test command.
-3. Add an `inductor-suite-notes` section that explains the interpretation of
+7. Add an `inductor-suite-notes` section that explains the interpretation of
    pre-existing failures, all reruns or interrupted work, the causes of
    `MISSED` entries, and common failure patterns grouped by suite and signature.
    Distinguish correctness failures, unsupported `gfx1250` behavior,
    crashes/signals, timeouts, and test-infrastructure failures.
-4. Add the note that issue comments below the description are intermediate
+8. Add the note that issue comments below the description are intermediate
    Cursor checkpoints and can be ignored.
-5. Generate the report from the completed log, checkpoint, analysis, and any
+9. Generate the report from the completed log, checkpoint, analysis, and any
    rerun artifacts. Deduplicate tests by pytest node ID and let the latest rerun
    result override an earlier result. Confirm every discovered test is
-   represented exactly once or explicitly classified as missed.
-6. Update the issue description, not a comment, using `gh issue edit --body-file`
-   or the GitHub API. Preserve any content outside generated HTML markers, avoid
-   secrets and unrestricted raw logs, then read the issue back to verify the
-   published body and totals.
+   represented exactly once or explicitly classified as missed, and validate
+   every suite row against the aggregate totals.
+10. Update the issue description, not a comment, using
+    `gh issue edit --body-file` or the GitHub API. Preserve any content outside
+    generated HTML markers, avoid secrets and unrestricted raw logs, then read
+    the issue back to verify the published body, formulas, and totals.
 
 ## Execution checklist
 
@@ -264,4 +286,6 @@ with a durable report modeled on
 - [ ] Mandatory-stop state and post-stop GPU-health procedure verified.
 - [ ] All missed tests rerun in shards of 50 and merged into final results.
 - [ ] Final summary and artifact paths reported.
+- [ ] Final outcome includes completeness, rate formulas, suite totals,
+      provenance, stop reason, GPU health, and unresolved clusters.
 - [ ] Final suite report published and verified in the issue description.
