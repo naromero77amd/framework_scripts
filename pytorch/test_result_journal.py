@@ -547,3 +547,43 @@ def pytest_addoption(parser):
     assert results[0]["timed_out"] is True
     assert "Fresh-process retry 1/1" in output
     assert "('RERUN'" not in output
+
+
+def test_test_env_prevents_source_checkout_from_shadowing_installed_torch(
+    tmp_path, monkeypatch
+):
+    source_torch = tmp_path / "torch"
+    source_torch.mkdir()
+    (source_torch / "__init__.py").write_text(
+        'raise RuntimeError("source checkout shadowed installed torch")\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        run_tests,
+        "_test_rocm_home",
+        lambda: "/opt/rocm",
+    )
+    monkeypatch.setattr(
+        run_tests,
+        "_torch_version_is_before_2_13",
+        lambda: False,
+    )
+
+    env = run_tests._build_test_env()
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import torch; "
+            "print(Path(torch.__file__).resolve())",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert env["PYTHONSAFEPATH"] == "1"
+    assert completed.returncode == 0, completed.stderr
+    assert str(source_torch) not in completed.stdout

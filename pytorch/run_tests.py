@@ -148,6 +148,13 @@ def _build_test_env():
         'HSA_FORCE_FINE_GRAIN_PCIE': '1',
         'HSA_TOOLS_DISABLE_REGISTER': '1',
         'PYTORCH_TESTING_DEVICE_ONLY_FOR': 'cuda',
+        # Pytest runs with the source checkout as its working directory. Tests
+        # that spawn ``python -c`` inherit that directory, which Python would
+        # normally prepend to sys.path. An unbuilt checkout's torch/ package
+        # would then shadow the installed package and fail because generated
+        # modules such as torch.version do not exist. Keep nested interpreters
+        # on the package installed for sys.executable instead.
+        'PYTHONSAFEPATH': '1',
     }
     env['ROCM_HOME'] = _test_rocm_home()
     if _torch_version_is_before_2_13():

@@ -11,7 +11,9 @@ Full-suite mode defaults to `test/inductor/test_torchinductor.py` and runs one p
 ## Requirements
 
 - **PyTorch path**: Pass the PyTorch checkout root with `--pytorch-path`.
+- `--pytorch-path` selects the source and test checkout; the `torch` package under test is resolved from the Python environment that runs pytest.
 - The script sets `PYTORCH_TEST_WITH_ROCM=1`, `HSA_FORCE_FINE_GRAIN_PCIE=1`, and `PYTORCH_TESTING_DEVICE_ONLY_FOR=cuda` when invoking tests.
+- The script sets `PYTHONSAFEPATH=1` so Python subprocesses spawned by tests do not prepend the source checkout working directory to `sys.path`. Without it, an unbuilt checkout's `torch/` directory can shadow the installed package and fail on generated modules such as `torch.version`.
 - `--include-inductor-wrapped-tests` additionally sets `PYTORCH_TEST_WITH_INDUCTOR=1`, matching PyTorch's `run_test.py --inductor` behavior.
 - **pytest, pytest-timeout, pytest-rerunfailures, and expecttest**: The script checks these imports and aborts with a clear message if any are missing. Install with `pip install pytest pytest-timeout pytest-rerunfailures expecttest`.
 - Timeout behavior depends on execution strategy:
