@@ -552,6 +552,7 @@ def pytest_addoption(parser):
 def test_test_env_prevents_source_checkout_from_shadowing_installed_torch(
     tmp_path, monkeypatch
 ):
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
     source_torch = tmp_path / "torch"
     source_torch.mkdir()
     (source_torch / "__init__.py").write_text(
@@ -570,7 +571,7 @@ def test_test_env_prevents_source_checkout_from_shadowing_installed_torch(
     )
 
     env = run_tests._build_test_env()
-    completed = subprocess.run(
+    python_c = subprocess.run(
         [
             sys.executable,
             "-c",
@@ -584,6 +585,28 @@ def test_test_env_prevents_source_checkout_from_shadowing_installed_torch(
         timeout=30,
     )
 
-    assert env["PYTHONSAFEPATH"] == "1"
-    assert completed.returncode == 0, completed.stderr
-    assert str(source_torch) not in completed.stdout
+    assert "PYTHONSAFEPATH" not in env
+    assert env["FRAMEWORK_SCRIPTS_SAFE_PYTHON_C"] == "1"
+    assert python_c.returncode == 0, python_c.stderr
+    assert str(source_torch) not in python_c.stdout
+
+    (tmp_path / "sibling.py").write_text(
+        'MESSAGE = "sibling import works"\n',
+        encoding="utf-8",
+    )
+    script = tmp_path / "normal_script.py"
+    script.write_text(
+        "from sibling import MESSAGE\nprint(MESSAGE)\n",
+        encoding="utf-8",
+    )
+    normal_script = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert normal_script.returncode == 0, normal_script.stderr
+    assert normal_script.stdout.strip() == "sibling import works"

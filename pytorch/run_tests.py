@@ -148,14 +148,20 @@ def _build_test_env():
         'HSA_FORCE_FINE_GRAIN_PCIE': '1',
         'HSA_TOOLS_DISABLE_REGISTER': '1',
         'PYTORCH_TESTING_DEVICE_ONLY_FOR': 'cuda',
-        # Pytest runs with the source checkout as its working directory. Tests
-        # that spawn ``python -c`` inherit that directory, which Python would
-        # normally prepend to sys.path. An unbuilt checkout's torch/ package
-        # would then shadow the installed package and fail because generated
-        # modules such as torch.version do not exist. Keep nested interpreters
-        # on the package installed for sys.executable instead.
-        'PYTHONSAFEPATH': '1',
     }
+    # Pytest runs with the source checkout as its working directory. For a
+    # nested ``python -c``, that directory can shadow the installed torch with
+    # an unbuilt checkout that lacks generated modules such as torch.version.
+    # PYTHONSAFEPATH=1 is too broad here: it also removes the directory of
+    # ordinary Python scripts, including benchmark scripts that import sibling
+    # modules. Install a startup hook that fixes only the unbuilt-checkout
+    # ``python -c`` case and leaves normal script imports unchanged.
+    startup_path = Path(__file__).resolve().parent / "python_startup"
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(startup_path) + (
+        os.pathsep + existing_pythonpath if existing_pythonpath else ""
+    )
+    env["FRAMEWORK_SCRIPTS_SAFE_PYTHON_C"] = "1"
     env['ROCM_HOME'] = _test_rocm_home()
     if _torch_version_is_before_2_13():
         env['TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER'] = '0'
