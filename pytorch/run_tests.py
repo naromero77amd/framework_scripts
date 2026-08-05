@@ -200,8 +200,9 @@ STATE_FAILED = "failed"
 STATE_TIMEDOUT = "timedout"
 STATE_MISSED = "missed"
 DISCOVERY_TIMEOUT_SECONDS = 1800
-DEFAULT_PER_TEST_TIMEOUT_SECONDS = 1200
+DEFAULT_PER_TEST_TIMEOUT_SECONDS = 300
 DEFAULT_PER_FILE_TIMEOUT_SECONDS = 43200
+FRESH_PROCESS_TIMEOUT_GRACE_SECONDS = 60
 DEFAULT_SHARD_SIZE = 100
 BATCH_MODE_FILE = "file"
 BATCH_MODE_SHARD = "shard"
@@ -799,13 +800,18 @@ def _read_stepcurrent_node(pytorch_path, key):
     return value if isinstance(value, str) else None
 
 
-def _run_file_batch(file_name, node_ids, args, log_file):
+def _run_file_batch(file_name, node_ids, args, log_file, process_timeout=None):
     """
     Run one file (or a filtered set of nodes from one file) in one pytest process.
     Returns (results, reason, elapsed, problem_node).
     """
     env = _build_test_env()
     targets = node_ids
+    effective_process_timeout = (
+        args.per_file_timeout
+        if process_timeout is None
+        else process_timeout
+    )
     with tempfile.TemporaryDirectory(prefix="run_tests_junit_") as tmpdir:
         junit_path = Path(tmpdir) / "pytest.xml"
         journal_path = Path(tmpdir) / "results.jsonl"
@@ -830,8 +836,6 @@ def _run_file_batch(file_name, node_ids, args, log_file):
             str(junit_path),
             f'--sc={stepcurrent_key}',
         ]
-        if args.retry_attempts > 0:
-            cmd.extend(['--reruns', str(args.retry_attempts)])
         header = (
             f"\n{'='*70}\n"
             f"Running file batch: {file_name} ({len(node_ids)} collected test(s))\n"
@@ -850,12 +854,12 @@ def _run_file_batch(file_name, node_ids, args, log_file):
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 cwd=str(args.pytorch_path),
-                timeout=args.per_file_timeout,
+                timeout=effective_process_timeout,
             )
             elapsed = time.time() - start_time
         except subprocess.TimeoutExpired as e:
             elapsed = time.time() - start_time
-            msg = f"✗ FILE TIMEDOUT ({file_name}) after {elapsed:.2f}s (limit: {args.per_file_timeout}s)\n"
+            msg = f"✗ FILE TIMEDOUT ({file_name}) after {elapsed:.2f}s (limit: {effective_process_timeout}s)\n"
             print(msg, end='')
             log_file.write(msg)
             log_file.flush()
@@ -918,7 +922,18 @@ def _run_file_batch(file_name, node_ids, args, log_file):
                 failed_node = failed_node or _read_stepcurrent_node(
                     args.pytorch_path, stepcurrent_key
                 ) or journal_active_node
-                return partial_results, "failure", elapsed, failed_node
+                reason = (
+                    "timeout"
+                    if failed_node and _output_indicates_timeout(output, "")
+                    else "failure"
+                )
+                if reason == "timeout":
+                    for item in partial_results:
+                        if item['name'] == failed_node and not item['success']:
+                            item['state'] = STATE_TIMEDOUT
+                            item['timed_out'] = True
+                            break
+                return partial_results, reason, elapsed, failed_node
             msg = f"✗ FILE FAILED ({file_name}) with exit code {result.returncode} ({elapsed:.2f}s); no JUnit results available.\n"
             print(msg, end='')
             log_file.write(msg)
@@ -934,7 +949,18 @@ def _run_file_batch(file_name, node_ids, args, log_file):
             if failed_node is None:
                 running_nodes = _running_nodes_from_output(output)
                 failed_node = running_nodes[-1] if running_nodes else None
-            return partial_results, "crash", elapsed, failed_node
+            reason = (
+                "timeout"
+                if failed_node and _output_indicates_timeout(output, "")
+                else "crash"
+            )
+            if reason == "timeout":
+                for item in partial_results:
+                    if item['name'] == failed_node and not item['success']:
+                        item['state'] = STATE_TIMEDOUT
+                        item['timed_out'] = True
+                        break
+            return partial_results, reason, elapsed, failed_node
 
         return _build_file_results(node_ids, testcase_states, file_name, log_file, elapsed)
 
@@ -1565,6 +1591,103 @@ def _run_test_batch(test_names, start_index, args, log_file, mode, by_id, count_
     return _write_run_summary(results, start_time, log_file, summary_title)
 
 
+def _normalize_process_attempt(node_id, item, reason, elapsed):
+    """Return one normalized result for a process-level test attempt."""
+    if item is None:
+        state = STATE_TIMEDOUT if reason == "timeout" else STATE_ERROR
+        item = {
+            'name': node_id,
+            'success': False,
+            'time': elapsed,
+            'timed_out': state == STATE_TIMEDOUT,
+            'state': state,
+            'signal_name': None,
+        }
+    else:
+        item = dict(item)
+        item.setdefault('name', node_id)
+        item.setdefault('time', 0.0)
+        item.setdefault('timed_out', False)
+        item.setdefault('signal_name', None)
+        if reason == "timeout" and not item.get('success'):
+            item['state'] = STATE_TIMEDOUT
+            item['success'] = False
+            item['timed_out'] = True
+    return item
+
+
+def _run_fresh_process_retries(
+    file_name,
+    problem_node,
+    original_item,
+    original_reason,
+    original_elapsed,
+    args,
+    log_file,
+):
+    """Retry one problem node in independently timed fresh pytest processes."""
+    attempts = [
+        _normalize_process_attempt(
+            problem_node, original_item, original_reason, original_elapsed
+        )
+    ]
+    retry_limit = max(0, args.retry_attempts)
+    per_test_timeout = (
+        args.per_test_timeout or DEFAULT_PER_TEST_TIMEOUT_SECONDS
+    )
+    process_timeout = (
+        per_test_timeout + FRESH_PROCESS_TIMEOUT_GRACE_SECONDS
+    )
+
+    for retry_number in range(1, retry_limit + 1):
+        msg = (
+            f"Fresh-process retry {retry_number}/{retry_limit} for "
+            f"{problem_node} (process timeout: {process_timeout}s)\n"
+        )
+        print(msg, end='')
+        log_file.write(msg)
+        log_file.flush()
+
+        retry_results, retry_reason, retry_elapsed, _ = _run_file_batch(
+            file_name,
+            [problem_node],
+            args,
+            log_file,
+            process_timeout=process_timeout,
+        )
+        retry_item = next(
+            (
+                item
+                for item in retry_results
+                if item['name'] == problem_node
+            ),
+            None,
+        )
+        attempt = _normalize_process_attempt(
+            problem_node, retry_item, retry_reason, retry_elapsed
+        )
+        attempts.append(attempt)
+        if attempt['success']:
+            break
+
+    final_attempt = attempts[-1]
+    success = bool(final_attempt['success'])
+    state = final_attempt['state']
+    return {
+        'name': problem_node,
+        'success': success,
+        'time': sum(float(item.get('time', 0.0)) for item in attempts),
+        'timed_out': any(item.get('timed_out') for item in attempts),
+        'state': state,
+        'attempts': len(attempts),
+        'flaky': len(attempts) > 1 and success,
+        'consistent_failure': (
+            not success and state in (STATE_FAILED, STATE_ERROR)
+        ),
+        'signal_name': final_attempt.get('signal_name'),
+    }
+
+
 def _run_file_node_group(file_name, node_ids, args, log_file, mode, test_names, node_index, results):
     """
     Run one file-scoped group of node ids with the existing file-batch recovery.
@@ -1581,7 +1704,7 @@ def _run_file_node_group(file_name, node_ids, args, log_file, mode, test_names, 
         )
 
         if (
-            reason in ("failure", "crash")
+            reason in ("failure", "crash", "timeout")
             and problem_node in remaining_nodes
         ):
             problem_position = remaining_nodes.index(problem_node)
@@ -1603,55 +1726,49 @@ def _run_file_node_group(file_name, node_ids, args, log_file, mode, test_names, 
                 )
                 results.append(recorded)
 
-            msg = (
-                f"Restarting failed test in a fresh pytest process: "
-                f"{problem_node}\n"
-            )
-            print(msg, end='')
-            log_file.write(msg)
-            log_file.flush()
-
-            retry_results, _retry_reason, retry_elapsed, _ = _run_file_batch(
-                file_name, [problem_node], args, log_file
-            )
-            retry_item = next(
-                (
-                    item
-                    for item in retry_results
-                    if item['name'] == problem_node
-                ),
-                None,
-            )
             original_item = result_by_name.get(problem_node)
-            if retry_item is not None:
-                final_state = retry_item['state']
-                final_elapsed = retry_item['time']
-            elif original_item is not None:
-                final_state = original_item['state']
-                final_elapsed = original_item['time']
-            else:
-                final_state = STATE_ERROR
-                final_elapsed = retry_elapsed
+            final_result = _run_fresh_process_retries(
+                file_name,
+                problem_node,
+                original_item,
+                reason,
+                elapsed,
+                args,
+                log_file,
+            )
 
             node_index += 1
             recorded = _record_file_batch_result(
                 problem_node,
-                final_state,
-                final_elapsed,
+                final_result['state'],
+                final_result['time'],
                 log_file,
                 node_index,
                 len(test_names),
             )
-            if (
-                retry_item is not None
-                and retry_item['success']
-                and (original_item is None or not original_item['success'])
-            ):
-                recorded['attempts'] = 2
-                recorded['flaky'] = True
-                recorded['consistent_failure'] = False
+            recorded.update({
+                'success': final_result['success'],
+                'timed_out': final_result['timed_out'],
+                'attempts': final_result['attempts'],
+                'flaky': final_result['flaky'],
+                'consistent_failure': final_result['consistent_failure'],
+                'signal_name': final_result['signal_name'],
+            })
+            if recorded['flaky']:
                 msg = (
-                    f"Recovered in a fresh pytest process: {problem_node}\n"
+                    f"Recovered after {recorded['attempts']} total attempts "
+                    f"using fresh pytest processes: {problem_node}\n"
+                )
+                print(msg, end='')
+                log_file.write(msg)
+                log_file.flush()
+            elif (
+                not recorded['success']
+                and recorded['attempts'] > 1
+            ):
+                msg = (
+                    f"Fresh-process retries exhausted after "
+                    f"{recorded['attempts']} total attempts: {problem_node}\n"
                 )
                 print(msg, end='')
                 log_file.write(msg)
@@ -1676,37 +1793,6 @@ def _run_file_node_group(file_name, node_ids, args, log_file, mode, test_names, 
 
         if reason is None:
             file_done = True
-            continue
-        if reason == "timeout" and problem_node and problem_node in remaining_nodes:
-            timeout_position = remaining_nodes.index(problem_node)
-            for node_id in remaining_nodes[:timeout_position]:
-                if node_id in recorded_names:
-                    continue
-                node_index += 1
-                recorded = _record_file_batch_result(
-                    node_id, STATE_MISSED, 0.0, log_file, node_index, len(test_names)
-                )
-                results.append(recorded)
-
-            if problem_node not in recorded_names:
-                node_index += 1
-                recorded = _record_file_batch_result(
-                    problem_node, STATE_TIMEDOUT, elapsed, log_file, node_index, len(test_names)
-                )
-                results.append(recorded)
-            else:
-                for result in reversed(results):
-                    if result['name'] == problem_node:
-                        result['state'] = STATE_TIMEDOUT
-                        result['success'] = False
-                        result['timed_out'] = True
-                        break
-            msg = f"Skipping timed-out test and continuing: {problem_node}\n"
-            print(msg, end='')
-            log_file.write(msg)
-            log_file.flush()
-            remaining_nodes = remaining_nodes[timeout_position + 1:]
-            unknown_timeout_misses = 0
             continue
 
         if reason == "timeout" and remaining_nodes:
@@ -2376,7 +2462,7 @@ def main():
         type=int,
         default=2,
         metavar='N',
-        help='Number of times to retry a failed test before recording final failure (default: 2; use 0 for no retries)'
+        help='Number of fresh pytest processes used to retry a failed or timed-out test before recording its final status (default: 2; use 0 for no retries)'
     )
     # Backward-compatible alias for the original option name. Keep it hidden so
     # the CLI distinguishes retry attempts from --rerun-failed mode.
@@ -2391,7 +2477,7 @@ def main():
         type=int,
         default=None,
         metavar='SECONDS',
-        help='Per-test pytest-timeout value in seconds for --batch-mode test, CSV, and rerun modes (default: 1200)'
+        help='Per-test pytest-timeout value in seconds for all execution modes (default: 300)'
     )
     parser.add_argument(
         '--batch-mode',

@@ -111,14 +111,20 @@ Batch modes apply only to full-suite mode (`--all-tests`). CSV mode and rerun-fa
 
 ## Retry Attempts And Failure Reporting
 
-By default, failed test executions are retried up to two times, matching PyTorch's normal retry count. Use `--retry-attempts 0` to disable retries entirely.
+By default, failed test executions are retried up to two times, matching PyTorch's normal retry count. Every retry runs in a fresh pytest process. Use `--retry-attempts 0` to disable retries entirely. The backward-compatible `--reruns N` alias selects the same fresh-process retry count.
 
 Recovered tests are reported separately as flaky, while tests that still fail after all attempts are reported as consistent failures. Signal-based exits, such as `SIGKILL` or `SIGSEGV`, are categorized as failed tests and include the signal name in the per-test log and final summary.
 
-File and shard modes have two retry layers:
+File and shard modes do not ask pytest to rerun a failed item in the same
+process. `-x` ends the batch at its first failure or per-test timeout. The
+runner then retries that node alone in up to `--retry-attempts` fresh
+processes, records the final result, and starts another fresh process for the
+unexecuted remainder of the file or shard.
 
-1. `pytest-rerunfailures` first retries the test inside the current pytest process.
-2. If the test still fails, `-x` exits that pytest process. The runner retries the failed node alone in a fresh process, records the final result, and starts another fresh process for the unexecuted remainder of the file or shard.
+Each isolated retry retains the configured per-test timeout and has an outer
+process watchdog of that timeout plus 60 seconds. The grace period allows
+pytest to write diagnostics and exit; the parent terminates the process if
+timeout handling or shutdown stalls.
 
 PyTorch's step-current pytest plugin records the active node for every file/shard child. This lets the parent recover the failure position and continue even when pytest crashes before complete JUnit XML is written.
 
@@ -126,7 +132,7 @@ Retry attempts and rerun-failed mode are different:
 
 | Concept | Option | When it happens | Purpose |
 |---------|--------|-----------------|---------|
-| Retry attempts | `--retry-attempts N` | During the current run, immediately after a failed test attempt. | Give a failed test another chance before recording final status. |
+| Retry attempts | `--retry-attempts N` or `--reruns N` | During the current run, immediately after a failed test attempt. | Retry the exact node in up to N fresh pytest processes before recording final status. |
 | Rerun-failed mode | `--rerun-failed LOG_FILE` | In a later run, using a previous log. | Build a new test list from tests that failed in an earlier run. |
 
 ## Suite-Level GPU Concurrency
@@ -179,7 +185,7 @@ pytest test/inductor/test_config.py --junitxml <tempfile>
 ```
 
 - Timeout is controlled by `--per-file-timeout` (default: 43200 seconds / 12 hours).
-- Per-test pytest-timeout is still enabled inside the file subprocess via `--per-test-timeout` (default: 1200 seconds / 20 minutes).
+- Per-test pytest-timeout is still enabled inside the file subprocess via `--per-test-timeout` (default: 300 seconds / 5 minutes).
 - Passing files are parsed from pytest's JUnit XML output so per-test pass/skip/xfail/fail/error counts remain available.
 - Pytest output is streamed directly to the text log rather than accumulated in parent-process memory.
 - A persistent test failure or process crash can cause additional fresh pytest processes for the failed node and the remaining nodes.
@@ -208,7 +214,7 @@ Test mode preserves the historical behavior: each discovered pytest node runs in
 pytest --timeout 300 test/inductor/test_config.py::TestInductorConfig::test_set
 ```
 
-- Timeout is controlled by `--per-test-timeout` (default: 1200 seconds / 20 minutes).
+- Timeout is controlled by `--per-test-timeout` (default: 300 seconds / 5 minutes).
 - The pytest-timeout plugin enforces the test timeout.
 - The script also applies an outer subprocess timeout of timeout + 60 seconds as a safety net for cases where pytest-timeout does not terminate a stuck process cleanly.
 
@@ -217,13 +223,13 @@ pytest --timeout 300 test/inductor/test_config.py::TestInductorConfig::test_set
 `--batch-mode file` and `--batch-mode shard` are optimized for lower subprocess overhead, but they still try to keep the run moving when a test fails, crashes, or hangs.
 
 - If a file subprocess passes, JUnit XML is parsed and each testcase is recorded as passed, skipped, failed, or error.
-- File and shard subprocesses use `-x`. After the configured in-process `--retry-attempts` are exhausted, pytest exits at the first persistent failure.
+- File and shard subprocesses use `-x` and do not use same-process pytest reruns, so pytest exits at the first failure or timeout.
 - If the subprocess writes partial JUnit XML, completed results and the failed node are recovered from it.
 - Each subprocess also uses a unique `--sc` key for PyTorch's step-current plugin. If pytest crashes without complete JUnit XML, the runner uses step-current plus streamed verbose output to recover the active node and completed results.
-- The failed or crashed node is retried alone in a fresh pytest process.
-- If the isolated retry passes, the test is recorded as recovered/flaky. If it fails again, it is recorded as a consistent failure.
+- The failed, crashed, or timed-out node is retried alone in up to `--retry-attempts` fresh pytest processes. Each isolated process has an outer watchdog equal to `--per-test-timeout + 60` seconds.
+- If an isolated retry passes, the test is recorded as recovered/flaky with its total attempt count. If all retries fail, the final failure is recorded.
 - The unexecuted remainder of the file or shard then continues in another fresh pytest process.
-- If a file subprocess exceeds `--per-file-timeout`, the script parses verbose pytest output to identify the currently running pytest node, records that node as timed out, skips it, and restarts file-mode execution for the remaining nodes in that file.
+- If a file subprocess exceeds `--per-file-timeout`, the script parses verbose pytest output to identify the currently running pytest node and applies the same fresh-process retry policy before continuing with the remaining nodes.
 - If tests before the timed-out node cannot be recovered from JUnit XML or verbose pytest output, they are recorded as missed rather than error.
 - If the timed-out node cannot be identified, the next unresolved test in that file is recorded as missed and the script continues with the following node.
 - If four unidentified timeouts happen in a row in the same file, the remaining nodes in that file are recorded as missed to avoid repeatedly rerunning an unknown hang.
@@ -332,7 +338,7 @@ Each test is classified into exactly one state:
 | `--num-gpus N` | Full-suite mode only | Run up to N test suites concurrently, one worker per GPU. Default: 1. |
 | `--per-file-timeout SECONDS` | Full-suite `file`/`shard` batch modes | Outer timeout for file or shard subprocesses. Default: 43200. |
 | `--shard-size N` | Full-suite `shard` mode and automatic opinfo sharding | Number of pytest node IDs per shard. Default: 100. |
-| `--per-test-timeout SECONDS` | All execution modes | Pytest-timeout per-test timeout. Default: 1200. |
+| `--per-test-timeout SECONDS` | All execution modes | Pytest-timeout per-test timeout. Default: 300. |
 | `--resume` | CSV and full-suite modes | Resume from the next test after the last checkpoint. |
 | `--no-checkpoint` | All execution modes | Disable checkpoint writing and resume handling. |
 | `--regex PATTERN` | Full-suite mode only | Filter discovered pytest node IDs by regex. |

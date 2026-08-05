@@ -306,3 +306,244 @@ def pytest_addoption(parser):
     assert result_by_name[node_ids[0]]["state"] == "passed"
     assert node_ids[1] not in result_by_name
     assert node_ids[2] not in result_by_name
+
+
+def test_file_batch_does_not_request_same_process_pytest_reruns(
+    tmp_path, monkeypatch
+):
+    node_id = "test/test_sample.py::TestSample::test_ok"
+    monkeypatch.setattr(
+        run_tests,
+        "_build_test_env",
+        lambda: os.environ.copy(),
+    )
+
+    def fake_run(cmd, **kwargs):
+        assert not any(
+            arg == "--reruns" or arg.startswith("--reruns=")
+            for arg in cmd
+        )
+        junit_path = Path(cmd[cmd.index("--junitxml") + 1])
+        junit_path.write_text(
+            """
+<testsuite>
+  <testcase
+    classname="test.test_sample.TestSample"
+    name="test_ok"
+    time="0.25"
+  />
+</testsuite>
+""".strip(),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(run_tests.subprocess, "run", fake_run)
+    args = SimpleNamespace(
+        per_test_timeout=120,
+        per_file_timeout=43200,
+        retry_attempts=2,
+        pytorch_path=str(tmp_path),
+    )
+
+    with (tmp_path / "batch.log").open("w+", encoding="utf-8") as log_file:
+        results, reason, _, problem_node = run_tests._run_file_batch(
+            "test/test_sample.py",
+            [node_id],
+            args,
+            log_file,
+        )
+
+    assert reason is None
+    assert problem_node is None
+    assert results[0]["state"] == "passed"
+
+
+def test_fresh_process_retries_have_independent_outer_watchdogs(
+    tmp_path, monkeypatch
+):
+    node_id = "test/test_sample.py::TestSample::test_eventual_pass"
+    process_timeouts = []
+
+    def fake_file_batch(
+        file_name,
+        node_ids,
+        args,
+        log_file,
+        process_timeout=None,
+    ):
+        process_timeouts.append(process_timeout)
+        if len(process_timeouts) == 1:
+            return [], "timeout", 180.0, node_id
+        return (
+            [
+                {
+                    "name": node_id,
+                    "success": True,
+                    "time": 1.0,
+                    "timed_out": False,
+                    "state": "passed",
+                }
+            ],
+            None,
+            1.0,
+            None,
+        )
+
+    monkeypatch.setattr(run_tests, "_run_file_batch", fake_file_batch)
+    args = SimpleNamespace(
+        per_test_timeout=120,
+        retry_attempts=2,
+    )
+    original_item = {
+        "name": node_id,
+        "success": False,
+        "time": 0.5,
+        "timed_out": False,
+        "state": "failed",
+    }
+
+    with (tmp_path / "retry.log").open("w+", encoding="utf-8") as log_file:
+        result = run_tests._run_fresh_process_retries(
+            "test/test_sample.py",
+            node_id,
+            original_item,
+            "failure",
+            0.5,
+            args,
+            log_file,
+        )
+
+    assert process_timeouts == [180, 180]
+    assert result["state"] == "passed"
+    assert result["attempts"] == 3
+    assert result["flaky"] is True
+    assert result["timed_out"] is True
+
+
+def test_file_group_retries_each_attempt_in_a_fresh_process(
+    tmp_path, monkeypatch
+):
+    test_dir = tmp_path / "test"
+    test_dir.mkdir()
+    test_file = test_dir / "test_fresh_retry.py"
+    test_file.write_text(
+        """
+import os
+from pathlib import Path
+
+
+class TestFreshRetry:
+    def test_passes_on_third_process(self):
+        counter = Path(os.environ["FRAMEWORK_SCRIPTS_RETRY_COUNTER"])
+        attempt = int(counter.read_text() or "0") + 1
+        counter.write_text(str(attempt))
+        assert attempt >= 3
+""".lstrip(),
+        encoding="utf-8",
+    )
+    (tmp_path / "conftest.py").write_text(
+        """
+def pytest_addoption(parser):
+    parser.addoption("--sc", action="store", default=None)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    counter = tmp_path / "attempts.txt"
+    counter.write_text("0", encoding="utf-8")
+    monkeypatch.setenv(
+        "FRAMEWORK_SCRIPTS_RETRY_COUNTER",
+        str(counter),
+    )
+    node_id = (
+        "test/test_fresh_retry.py::"
+        "TestFreshRetry::test_passes_on_third_process"
+    )
+    args = SimpleNamespace(
+        per_test_timeout=5,
+        per_file_timeout=30,
+        retry_attempts=2,
+        pytorch_path=str(tmp_path),
+        stop_on_failure=False,
+        no_checkpoint=True,
+        log_file=str(tmp_path / "fresh-retry.log"),
+        csv_file=None,
+    )
+    results = []
+
+    with Path(args.log_file).open("w+", encoding="utf-8") as log_file:
+        node_index, stop_requested = run_tests._run_file_node_group(
+            "test/test_fresh_retry.py",
+            [node_id],
+            args,
+            log_file,
+            "full_suite",
+            [node_id],
+            0,
+            results,
+        )
+
+    assert node_index == 1
+    assert stop_requested is False
+    assert counter.read_text(encoding="utf-8") == "3"
+    assert results[0]["state"] == "passed"
+    assert results[0]["attempts"] == 3
+    assert results[0]["flaky"] is True
+
+
+def test_file_group_retries_timeouts_in_fresh_processes(tmp_path):
+    test_dir = tmp_path / "test"
+    test_dir.mkdir()
+    test_file = test_dir / "test_timeout.py"
+    test_file.write_text(
+        """
+import time
+
+
+class TestTimeout:
+    def test_times_out(self):
+        time.sleep(5)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    (tmp_path / "conftest.py").write_text(
+        """
+def pytest_addoption(parser):
+    parser.addoption("--sc", action="store", default=None)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    node_id = "test/test_timeout.py::TestTimeout::test_times_out"
+    log_path = tmp_path / "timeout-retry.log"
+    args = SimpleNamespace(
+        per_test_timeout=1,
+        per_file_timeout=10,
+        retry_attempts=1,
+        pytorch_path=str(tmp_path),
+        stop_on_failure=False,
+        no_checkpoint=True,
+        log_file=str(log_path),
+        csv_file=None,
+    )
+    results = []
+
+    with log_path.open("w+", encoding="utf-8") as log_file:
+        node_index, stop_requested = run_tests._run_file_node_group(
+            "test/test_timeout.py",
+            [node_id],
+            args,
+            log_file,
+            "full_suite",
+            [node_id],
+            0,
+            results,
+        )
+
+    output = log_path.read_text(encoding="utf-8")
+    assert node_index == 1
+    assert stop_requested is False
+    assert results[0]["state"] == "timedout"
+    assert results[0]["attempts"] == 2
+    assert results[0]["timed_out"] is True
+    assert "Fresh-process retry 1/1" in output
+    assert "('RERUN'" not in output

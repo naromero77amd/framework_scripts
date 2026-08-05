@@ -50,11 +50,17 @@ test execution, and maintain rolling progress in framework_scripts issue #5.
     --batch-mode file \
     --num-gpus 1 \
     --retry-attempts 2 \
-    --per-test-timeout 1200 \
+    --per-test-timeout 120 \
     --per-file-timeout 43200 \
     --log-file <timestamped-log>
   ```
 
+- This gfx1250 run intentionally overrides the runner's five-minute default
+  with a two-minute per-test timeout.
+- Retry attempts must run in fresh pytest processes, not through same-process
+  pytest reruns. Each isolated retry keeps the two-minute test timeout and uses
+  a three-minute outer process watchdog, including one minute for diagnostics
+  and shutdown.
 - `--include-inductor-all-tests` is required because plain `--all-tests` covers
   only the default Inductor file.
 - Store timestamped log, checkpoint, metadata, analysis, monitor log, and exit
