@@ -11,17 +11,17 @@ the user-selected GitHub results issue.
 
 ## Outcome classification
 
-- `P1`: `TIMED OUT` or `MISSED`. These receive the first targeted
-  adjudication pass.
-- `P2`: `FAILED` or `ERROR`. These remain the second-priority investigation
-  queue and are not automatically retried during the primary run.
+- `P1`: `TIMED OUT` or `MISSED`. This is a reporting and triage label only.
+- `P2`: `FAILED` or `ERROR`. This is the second-priority reporting and
+  investigation label only.
 - A suite inherits its highest contained priority: any timeout/miss makes it
   P1; otherwise any failure/error makes it P2. A suite with no unresolved
   outcome is left unprioritized.
 - Non-failing outcomes are `PASSED`, `SKIPPED`, and `XFAILED`. Unresolved
   outcomes are `FAILED`, `ERROR`, `TIMED OUT`, and `MISSED`.
-- Merge every newer terminal result over the older result by exact pytest node
-  ID. Never merge by file position, count, or display name.
+- Execute each included exact pytest node at most once. Preserve its single
+  primary outcome; no P1, P2, timeout, miss, failure, or error reruns are part
+  of this plan.
 
 ## Fail-closed preflight
 
@@ -100,7 +100,7 @@ the user-selected GitHub results issue.
    and verify the result. Stop and prompt the user on any failure.
 11. Write an atomic preflight artifact containing explicit pass/fail records for
    manifest, collection, environment, optional dependencies, cache isolation,
-   and GPU smoke checks.
+   started-node journaling, single-attempt resume guards, and GPU smoke checks.
 12. Validate read, comment, and description-edit access to the selected results
     issue only after local preflight passes. Confirm its canonical URL still
     matches `RESULTS_ISSUE_URL`. Create one rolling progress comment after the
@@ -117,8 +117,8 @@ the user-selected GitHub results issue.
 - Preserve the complete validated environment from manifest collection and GPU
   smoke through execution. Record unset variables explicitly in metadata.
 - Export and verify `HSA_HOTSWAP_ENABLE=1` before manifest collection, GPU
-  smoke, every primary or P1 `run_tests.py` invocation, and every resume. Never
-  rely on an inherited shell value without recording the effective value.
+  smoke, the primary `run_tests.py` invocation, and every resume. Never rely on
+  an inherited shell value without recording the effective value.
 - The wrapper must launch the runner in its own process group with `setsid` and
   keep the safety monitor outside that group.
 - In the `tests` window, the wrapper runs:
@@ -177,8 +177,6 @@ the user-selected GitHub results issue.
 - Validate deadline-aware pause and resume before the real run. A blind process
   kill that loses completed-node attribution or causes automatic re-execution
   does not satisfy the one-attempt primary policy.
-- Do not launch a 480-second P1 node unless at least its full 540-second outer
-  watchdog remains before 10:00 AM Central.
 - At the next midnight boundary, repeat GPU-idle inspection, environment and
   manifest hash checks, and the GPU smoke test before resuming with the same
   flags and log path plus `--resume`.
@@ -213,11 +211,12 @@ the user-selected GitHub results issue.
    terminal and rolling-comment update. Include completion classification,
    counts, duration, runner/monitor exit codes, post-run GPU smoke result,
    resume information, tmux session, and local artifact paths. Update the issue
-   description only after P1 adjudication and exact-node merging complete.
+   description only after the single primary pass and exact-node reconciliation
+   complete.
 
 ## Safety monitoring and mandatory stop policy
 
-Run a dedicated safety monitor beside every full-suite or targeted runner. The
+Run a dedicated safety monitor beside the full-suite runner. The
 runner must start in its own process group with `setsid`; the monitor remains
 outside that group so it can terminate the complete runner/pytest/compile-worker
 tree. The wrapper must treat a nonzero monitor exit as a mandatory stop, record
@@ -273,66 +272,39 @@ health stops listed below, and verify that behavior before launch.
   host, or GPU architecture.
 - Add a node only when the current campaign produces direct evidence of an
   unrecoverable hard hang or GPU loss, and require explicit user approval
-  before excluding it from a resume or P1 attribution round. Record the exact
-  node ID, architecture, timestamp, process state, recovery actions, and
-  approval in run metadata.
-- Apply a current-campaign approved exclusion to primary-run resumes and P1
-  attribution rounds with
+  before excluding it from a resume. Record the exact node ID, architecture,
+  timestamp, process state, recovery actions, and approval in run metadata.
+- Apply a current-campaign approved exclusion to primary-run resumes with
   `PYTEST_ADDOPTS=--deselect=<node-id>` (preserving any existing
   `PYTEST_ADDOPTS`). Record the node as an intentional unresolved exclusion in
-  the final report, not as a test to retry.
+  the final report. Do not execute it again.
 - Keep approved exclusions only in a run-local manifest under the artifact
   directory. Never depend on a historical manifest path.
 
-## Mandatory P1 adjudication
+## Single-pass completion policy
 
-1. Let the complete primary suite finish. Build the latest exact-node map and
-   select every `TIMED OUT` or `MISSED` node as P1. Deduplicate by exact pytest
-   node ID and remove approved hard-hang quarantines.
-2. Run the P1 CSV through the runner's exact-node CSV mode:
-
-   ```bash
-   export HSA_HOTSWAP_ENABLE=1
-
-   /opt/venv/bin/python \
-     /home/niromero/docker_workspace/framework_scripts/pytorch/run_tests.py \
-     <p1-manifest.csv> \
-     --pytorch-path /workspace/pytorch \
-     --retry-attempts 0 \
-     --per-test-timeout 480 \
-     --log-file <p1-log>
-   ```
-
-   CSV mode already launches one fresh pytest process per exact node. Do not
-   claim `--shard-size 1` controls this path; shard size applies only to
-   full-suite batching. The runner supplies its 60-second process grace, giving
-   each node a 540-second outer watchdog.
-3. Before P1 launch, verify that 480 seconds exceeds the effective primary
-   default. If it does not, stop and ask the user for a longer P1 timeout rather
-   than shortening the adjudication attempt. Use one longer attempt to
-   distinguish slow tests from persistent timeouts; do not repeat attempts at
-   the primary default.
-4. Do not use `--rerun-failed`: it does not select `MISSED` entries and its
-   execution path does not provide the required one-node shard behavior.
-5. Keep a separate immutable P1 manifest, selection hash, metadata, state,
-   monitor artifacts, exit JSON, and summaries. Preserve the validated software
-   and scheduler environment while using a separate run cache.
-6. If a P1 node is still `MISSED`, allow at most one additional exact-node
-   attribution round. Do not repeat nodes that passed, failed, errored, or
-   timed out. Stop after two total attribution rounds or any no-progress round.
-7. Merge each newer P1 terminal outcome over the primary result by exact node
-   ID. Nodes still timed out after 480 seconds remain P1; do not silently
-   relabel them as failures.
-8. Build the P2 queue from the merged `FAILED` and `ERROR` nodes. Do not
-   automatically rerun P2 as part of this campaign; use its exact manifest for
-   later focused reproduction.
-9. Do not publish final suite totals or replace the issue description until the
-   P1 merge and aggregate reconciliation complete.
+1. Execute the immutable full-suite manifest once. Each exact pytest node may
+   be started at most once during this campaign.
+2. Keep `--retry-attempts 0`. Do not invoke `--rerun-failed`, create targeted
+   rerun manifests, or launch a second attempt for a passed, skipped, xfailed,
+   failed, errored, timed-out, missed, interrupted, or quarantined node.
+3. File-batch recovery may continue with exact nodes that have never started,
+   but it must not repeat a node from the interrupted batch. Persist both
+   started-node and terminal-result journals so this invariant can be proved.
+4. A schedule pause, mandatory health stop, or process interruption may resume
+   only with never-started exact nodes. If the wrapper cannot prove that a node
+   never started, classify it as `MISSED` and skip it rather than execute it
+   again.
+5. After the primary pass, build one exact-node result map. Classify
+   `TIMED OUT`/`MISSED` outcomes as P1 and `FAILED`/`ERROR` outcomes as P2 for
+   reporting only. Preserve those outcomes without further execution.
+6. Publish final totals only after every included manifest node has exactly one
+   terminal outcome or an explicit `MISSED`/approved-exclusion classification.
 
 ## Final GitHub issue description
 
-After the complete run and mandatory P1 adjudication finish, replace the
-description of the user-selected `RESULTS_ISSUE_URL` with a durable report
+After the single full-suite pass and exact-node reconciliation finish, replace
+the description of the user-selected `RESULTS_ISSUE_URL` with a durable report
 modeled on
 [the current framework_scripts issue #5 description](https://github.com/naromero77amd/framework_scripts/issues/5#issue-4971129324).
 Use that description's presentation and section structure as the template, but
@@ -343,7 +315,7 @@ comparison rules or reintroduce a P3 category.
    `<gpu-architecture> PyTorch Inductor Outcome` heading and an
    `> [!IMPORTANT]` completeness callout. State completed/planned/pending
    coverage and all intentional exclusions. If work remains, label the report
-   as the latest merged outcome rather than a completed final result.
+   as a partial single-pass outcome rather than a completed final result.
 2. Add `### Overall Result` with:
    - discovered, excluded, and included exact-node counts;
    - explicit `PASSED` outcomes;
@@ -351,7 +323,7 @@ comparison rules or reintroduce a P3 category.
      `(passed + skipped + xfailed) / included`;
    - unresolved rate,
      `(failed + error + timedout + missed) / included`; and
-   - the exact-node latest-result merge rule.
+   - the rule that each exact node retains its one primary outcome.
    Include a baseline rate or `(was ...)` comparison only when its scope and
    denominator are exactly comparable. The latest non-failing and unresolved
    rates must reconcile to 100%.
@@ -363,13 +335,13 @@ comparison rules or reintroduce a P3 category.
    containing timeout/miss, 🟡 **P2** for any suite containing failure/error,
    and blank for a clean suite.
 4. Add `## Execution, Improvement, and Provenance Notes` with subsections for
-   the completed primary run, P1 adjudication, any exactly comparable
-   improvements or regressions, exact result provenance, and unresolved-outcome
-   interpretation. Include primary/P1 manifest hashes, coverage and pending
-   counts, batching/timeouts/retry settings, source artifacts, transition
-   counts, scheduled pauses/resumes, active-test and wall-clock durations, final
-   stop reason, and post-run process/GPU health. Do not imply causality when
-   multiple software or environment variables changed.
+   the completed single primary run, any exactly comparable improvements or
+   regressions, exact result provenance, and unresolved-outcome interpretation.
+   Include the primary manifest hash, coverage and pending counts,
+   batching/default-timeout/zero-retry settings, source artifacts, transition
+   counts, scheduled pauses/resumes, active-test and wall-clock durations,
+   final stop reason, and post-run process/GPU health. Do not imply causality
+   when multiple software or environment variables changed.
 5. Add `## Environment` with the container/image identity, GPU model and
    architecture, Python, PyTorch and ROCm/HIP versions, optional dependency
    versions, selected run schedule and timezone, scheduler and visibility
@@ -386,18 +358,18 @@ comparison rules or reintroduce a P3 category.
    filtering.
 7. Add reproducibility details containing the exact workspace/container setup,
    runner commit and uncommitted diff, selected Triton provenance, environment
-   overrides, any Triton build-helper invocation, primary and P1 commands,
+   overrides, any Triton build-helper invocation, the primary command,
    exclusions, resume history, and local artifact paths. Avoid secrets and
    unrestricted raw logs.
 8. End with the prominent note from the reference description that comments
    below the description are intermediate Cursor checkpoints and can be
    ignored.
-9. Generate the report from the completed manifests, logs, checkpoints, states,
-   metadata, analyses, and P1 artifacts. Deduplicate by exact pytest node ID and
-   let the latest completed targeted result override its earlier result.
-   Confirm every discovered node is represented exactly once or explicitly
-   classified as missed, then validate every suite row, exclusion, priority,
-   transition, and aggregate formula. Do not hardcode expected counts.
+9. Generate the report from the primary manifest, logs, checkpoints, state,
+   metadata, and analysis. Confirm from the started-node and terminal-result
+   journals that no exact node had more than one attempt. Ensure every
+   discovered node is represented exactly once or explicitly classified as
+   missed/excluded, then validate every suite row, priority, transition, and
+   aggregate formula. Do not hardcode expected counts.
 10. Update the issue description, not a comment, with
     `gh issue edit <number> --repo <owner>/<repository> --body-file <path>` or
     the GitHub API, using only the destination resolved from
@@ -417,7 +389,7 @@ comparison rules or reintroduce a P3 category.
 - [ ] User selected continuous 24/7 or midnight-to-10:00-AM Central execution;
       schedule and `America/Chicago` boundaries recorded and verified.
 - [ ] `HSA_HOTSWAP_ENABLE=1` exported and verified for discovery, smoke tests,
-      primary/P1 execution, and resumes.
+      primary execution, and resumes.
 - [ ] Preflight gates passed.
 - [ ] Immutable exact-node manifest, count, and SHA-256 recorded.
 - [ ] Full Inductor suite running in tmux.
@@ -428,10 +400,11 @@ comparison rules or reintroduce a P3 category.
 - [ ] Mandatory-stop state and post-stop GPU-health procedure verified.
 - [ ] Primary run completed with zero automatic retries.
 - [ ] Scheduled pauses, if selected, preserved exact-node attribution and
-      resumed only after next-window preflight.
-- [ ] Every P1 timeout/miss node run once at 480 seconds in a fresh process.
-- [ ] Any second attribution round limited to still-missed nodes only.
-- [ ] P1 outcomes merged and P2 failure/error queue generated.
+      resumed only never-started nodes after next-window preflight.
+- [ ] Started-node journal proves every included node had at most one attempt;
+      no rerun command or targeted rerun manifest was created.
+- [ ] P1 timeout/miss and P2 failure/error queues generated from primary
+      outcomes for reporting only.
 - [ ] Final summary and artifact paths reported.
 - [ ] Final outcome includes completeness, reconciled rate formulas, suite
       totals, P1/P2 labels, provenance, stop reason, GPU health, and unresolved
