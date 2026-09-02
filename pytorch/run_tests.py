@@ -146,7 +146,6 @@ def _build_test_env():
         **subprocess.os.environ.copy(),
         'PYTORCH_TEST_WITH_ROCM': '1',
         'HSA_FORCE_FINE_GRAIN_PCIE': '1',
-        'HSA_TOOLS_DISABLE_REGISTER': '1',
         'PYTORCH_TESTING_DEVICE_ONLY_FOR': 'cuda',
     }
     # Pytest runs with the source checkout as its working directory. For a
