@@ -10,6 +10,17 @@ import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+EXCLUDED_TITLE_PREFIXES = ("Test: ", "UNSTABLE trunk")
+
+
+def is_excluded_title(title: str) -> bool:
+    normalized = " ".join(title.split())
+    return any(normalized.startswith(prefix) for prefix in EXCLUDED_TITLE_PREFIXES)
+
+
+def include_issue(issue: dict[str, Any]) -> bool:
+    return not is_excluded_title(issue["title"])
+
 
 def gh_json(*args: str) -> Any:
     result = subprocess.run(
@@ -129,7 +140,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default="pytorch/pytorch")
     parser.add_argument("--days", type=int, default=14)
-    parser.add_argument("--login", help="GitHub login; defaults to the gh user")
+    parser.add_argument(
+        "--login",
+        default="naromero77amd",
+        help="GitHub login for the primary identity (default: naromero77amd)",
+    )
     parser.add_argument(
         "--completed-by",
         default="k-artem,fjankovi,jeffdaily",
@@ -152,8 +167,7 @@ def main() -> int:
     if args.days < 1:
         raise RuntimeError("--days must be at least 1")
 
-    user_endpoint = f"users/{args.login}" if args.login else "user"
-    user = gh_json("api", user_endpoint)
+    user = gh_json("api", f"users/{args.login}")
     login = user["login"]
     display_name = user.get("name") or login
 
@@ -265,14 +279,20 @@ def main() -> int:
                 entry["activity_contributors"].add(canonical_login)
 
     not_planned = [
-        issue for issue in triaged.values() if "not planned" in issue["reasons"]
+        issue
+        for issue in triaged.values()
+        if "not planned" in issue["reasons"] and include_issue(issue)
     ]
+    completed = {
+        url: issue for url, issue in completed.items() if include_issue(issue)
+    }
     other_triaged = [
         issue
         for issue in triaged.values()
         if {"commented", "additional activity"} & issue["reasons"]
         and "not planned" not in issue["reasons"]
         and issue["url"] not in completed
+        and include_issue(issue)
     ]
     person_names = {
         login: display_name,
