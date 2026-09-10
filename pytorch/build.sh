@@ -7,7 +7,58 @@ die() {
 }
 
 require_pytorch_checkout() {
-  [[ -f setup.py && -d .git && -d tools/amd_build ]] || die "Run this script from the PyTorch repository root."
+  # setup.py is no longer a reliable checkout marker: PyTorch 2.14 replaced it
+  # with a compatibility shim, and the file is scheduled for removal entirely.
+  # pyproject.toml and tools/amd_build are present in both the older branches we
+  # build and the newer PEP 517/scikit-build-core branches.
+  [[ -f pyproject.toml && -d tools/amd_build ]] ||
+    die "Run this script from the PyTorch repository root."
+
+  # Do not test `-d .git` here. A primary checkout has a .git directory, but a
+  # linked Git worktree has a .git *file* that points at the shared repository.
+  # git rev-parse understands both layouts and rejects non-Git directories.
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+    die "Run this script from a Git checkout."
+}
+
+supports_spin_command() {
+  # Spin loads commands from the checked-out PyTorch branch. Command availability
+  # therefore reflects that branch: for example, older releases have `clean`
+  # but predate `install`. Probe the individual command rather than assuming all
+  # Spin commands appeared together.
+  python -m spin "$1" --help >/dev/null 2>&1
+}
+
+clean_pytorch() {
+  if supports_spin_command clean; then
+    # PyTorch 2.14+ uses scikit-build-core through PEP 517. setup.py is only a
+    # deprecation shim there, and `python setup.py clean` intentionally fails.
+    # `spin clean` is the supported replacement.
+    python -m spin clean
+  elif [[ -f setup.py ]]; then
+    # Keep the script usable with older branches that do not provide Spin's
+    # clean command and still use setuptools for build orchestration.
+    python setup.py clean
+  else
+    die "This PyTorch branch provides neither 'spin clean' nor 'setup.py clean'."
+  fi
+}
+
+select_install_command() {
+  if supports_spin_command install; then
+    # `spin install` performs a non-editable PEP 517 install. It prefers
+    # `uv pip` when available and otherwise runs the active Python's pip with
+    # `--no-build-isolation -v`. Build configuration still comes from the
+    # environment variables supplied below.
+    install_cmd=(python -m spin install)
+  elif [[ -f setup.py ]]; then
+    # PyTorch 2.13 and older do not define `spin install`, so retain their
+    # setuptools entry point. Store the command in an array to preserve argument
+    # boundaries safely when it is invoked through `env`.
+    install_cmd=(python setup.py install)
+  else
+    die "This PyTorch branch provides neither 'spin install' nor 'setup.py install'."
+  fi
 }
 
 require_build_backend() {
@@ -152,12 +203,14 @@ sync_submodules
 # change in significant ways. Incremental builds skip this so interrupted builds
 # can resume without discarding already-built artifacts.
 if [[ "$PYTORCH_INCREMENTAL_BUILD" == "0" ]]; then
-  python setup.py clean # needed when switching branches
+  clean_pytorch
 fi
 # git clean . -dfx # some times also needed due to leftoever files due to submodules that have been removed
 
 export MAX_JOBS=128 # use as many CPU cores as possible to build PyTorch
-pip uninstall -y torch # otherwise, the final PyTorch install could fail
+# Use pip through the selected Python interpreter. A bare `pip` executable can
+# belong to a different environment and uninstall the wrong torch installation.
+python -m pip uninstall -y torch # otherwise, the final PyTorch install could fail
 
 # Legacy, only needed if building AOTriton from scratch.
 # the three lines below are because aotriton build system is problematic 
@@ -190,12 +243,17 @@ common_env=(
   USE_ROCM_CK_GEMM="${USE_CK}"
 )
 
+# Select the install frontend only after validating the checkout. The resulting
+# array is shared by the ROCm and CUDA paths so their packaging behavior cannot
+# drift apart as PyTorch removes setup.py.
+select_install_command
+
 if [[ "$PYTORCH_BUILD_BACKEND" == "rocm" ]]; then
   # Force PyTorch to auto-detect the host ROCm arch instead of inheriting a
   # multi-arch value from the surrounding shell.
   unset PYTORCH_ROCM_ARCH
   python tools/amd_build/build_amd.py # hipification
-  env "${common_env[@]}" USE_ROCM=1 python setup.py install 2>&1 | tee build.log # works
+  env "${common_env[@]}" USE_ROCM=1 "${install_cmd[@]}" 2>&1 | tee build.log
 else
   export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
   export CUDA_PATH="${CUDA_PATH:-$CUDA_HOME}"
@@ -204,5 +262,5 @@ else
   # CUDA target is currently hard-coded for NVIDIA H100/Hopper.
   unset TORCH_CUDA_ARCH_LIST
   export TORCH_CUDA_ARCH_LIST="9.0;9.0a"
-  env "${common_env[@]}" USE_CUDA=1 USE_ROCM=0 python setup.py install 2>&1 | tee build.log
+  env "${common_env[@]}" USE_CUDA=1 USE_ROCM=0 "${install_cmd[@]}" 2>&1 | tee build.log
 fi
