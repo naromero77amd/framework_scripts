@@ -1,24 +1,24 @@
 ---
 name: PAAS Priority Optimization
-overview: Use the tested PAAS fused-kernel pipeline to tune all 1,037 priority kernel instances on the host’s gfx1250 GPU, while preserving the original repository. The campaign will correct the gfx942-to-gfx1250 metadata mismatch, use one timing replica as requested, remain resumable, and produce path-aware results that do not collapse duplicate kernel names.
+overview: Use the tested PAAS fused-kernel pipeline to tune the 72-kernel representative subset listed in inductor/kernels/priority/priority_representative_kernel_paths.txt on the host’s gfx1250 GPU. Preserve the full 1,037-kernel source corpus, retarget only the staged subset, use one timing replica, and keep path-aware results.
 todos:
   - id: campaign-control
-    content: Start the tmux campaign and initialize timing, logs, and progress telemetry
-    status: completed
+    content: Start the 72-kernel subset campaign and initialize timing, logs, and progress telemetry
+    status: pending
   - id: paas-portability
     content: Add and test gfx1250-aware PAAS hardware-limit handling
     status: completed
   - id: campaign-inputs
-    content: Create a manifested work copy and normalize device metadata
-    status: completed
+    content: Stage the exact 72 paths and prepare a target-specific manifested copy
+    status: pending
   - id: pilot
-    content: Validate the full PAAS pipeline on three representative kernels
-    status: completed
-  - id: baseline-all
-    content: Benchmark all inputs and capture gfx1250 launch parameters
-    status: completed
-  - id: tune-all
-    content: Run resumable one-replica exhaustive tuning for every eligible kernel
+    content: Validate the combined PAAS branch on pointwise, reduction, and persistent-reduction subset kernels
+    status: pending
+  - id: baseline-subset
+    content: Benchmark the 72 selected inputs and capture gfx1250 launch parameters
+    status: pending
+  - id: tune-subset
+    content: Run resumable one-replica tuning for every eligible selected kernel
     status: pending
   - id: report
     content: Generate path-aware winner, coverage, provenance, and failure reports
@@ -26,21 +26,21 @@ todos:
 isProject: false
 ---
 
-# Optimize Priority Kernels with PAAS
+# Optimize the Representative Priority-Kernel Subset with PAAS
 
 ## Confirmed understanding and scope
 
-PAAS lowers this corpus through five stages: benchmark the original Inductor wrapper, capture its launch parameters, generate bare `@triton.jit` tune scripts, exhaustively test legal block/launch configurations, and summarize the valid rows. The relevant implementation is in [bench_kernels.py](/home/niromero/docker_workspace/inductor-triton-hacks/paas/processing/bench_kernels.py), [create_standalone_kernel.py](/home/niromero/docker_workspace/inductor-triton-hacks/paas/kernel_generator/create_standalone_kernel.py), [manager.py](/home/niromero/docker_workspace/inductor-triton-hacks/paas/tuner/simple/manager.py), and [organizer.py](/home/niromero/docker_workspace/inductor-triton-hacks/paas/downstream/organizer.py).
+PAAS lowers this corpus through five stages: benchmark the original Inductor wrapper, capture its launch parameters, generate bare `@triton.jit` tune scripts, search target-legal block/launch configurations under the selected policy, and summarize the valid rows. The relevant implementation is in [bench_kernels.py](/home/niromero/docker_workspace/inductor-triton-hacks/paas/processing/bench_kernels.py), [create_standalone_kernel.py](/home/niromero/docker_workspace/inductor-triton-hacks/paas/kernel_generator/create_standalone_kernel.py), [manager.py](/home/niromero/docker_workspace/inductor-triton-hacks/paas/tuner/simple/manager.py), and [organizer.py](/home/niromero/docker_workspace/inductor-triton-hacks/paas/downstream/organizer.py).
 
-The input tree contains 1,037 runnable fused kernels: 624 pointwise, 284 reduction, and 129 persistent-reduction instances across 46 model/category leaf directories. All instances will be tuned, including repeated kernel names with different shapes. There are no templated GEMM/conv/flex kernels in this tree, so `paas-organize-*` and the template workflow are out of scope.
+The source tree contains 1,037 runnable fused kernels: 624 pointwise, 284 reduction, and 129 persistent-reduction instances. This campaign will tune only the 72 exact paths in [priority_representative_kernel_paths.txt](kernels/priority/priority_representative_kernel_paths.txt): 27 pointwise, 20 reduction, and 25 persistent-reduction kernels. The list was selected for body, memory-access, reduction-regime, and geometry diversity; model-balanced duplicates are intentionally excluded. There are no templated GEMM/conv/flex kernels in the selected set.
 
 ```mermaid
 flowchart LR
-  Inputs["1,037 gfx942-captured kernels"] --> Copy["Immutable campaign copy"]
-  Copy --> Normalize["Normalize metadata for gfx1250"]
+  Inputs["1,037-kernel source corpus"] --> Select["Stage 72 exact paths"]
+  Select --> Normalize["PAAS target copy for gfx1250"]
   Normalize --> Baseline["PAAS Inductor baseline and launch capture"]
-  Baseline --> Generate["Generate tune scripts in 46 leaf directories"]
-  Generate --> Search["One-replica exhaustive search"]
+  Baseline --> Generate["Generate selected tune scripts by populated leaf"]
+  Generate --> Search["One-replica capped search"]
   Search --> LeafReports["Per-leaf PAAS summaries"]
   LeafReports --> GlobalReport["Path-aware campaign report"]
 ```
@@ -49,11 +49,24 @@ flowchart LR
 
 - Start all implementation and tuning work inside a named tmux session, `paas-priority-gfx1250`, before installing PAAS or creating campaign artifacts. Use a driver window for the orchestration process and a monitor window for progress; pipe both panes to durable logs. The run must remain resumable after an IDE, shell, SSH, or agent interruption, and `tmux attach -t paas-priority-gfx1250` must restore the live terminal view.
 - Record `campaign_started_at` immediately when the tmux driver begins and `campaign_finished_at` only after final coverage/report generation. Use a monotonic timer for elapsed durations and UTC timestamps for auditability. Track total end-to-end wall time, each stage's time, and each model's tuning time in a machine-readable `campaign_state.json`.
-- Record the clean repository revisions: `inductor-triton-hacks` at `891daa3e...` and `Triton_Conv_Development/gemm-hf-branch` at `2d7f07e5...`.
+- Record the clean repository revisions: `inductor-triton-hacks` branch `paas-target-portability-block-cap` (latest `origin/main` plus the reduction-cap and target-portability commits) and `Triton_Conv_Development/gemm-hf-branch` at `2d7f07e5...`.
 - Install the local internal PAAS checkout editable; do not install the public `paas` URL from [requirements.txt](/home/niromero/docker_workspace/Triton_Conv_Development/requirements.txt).
 - Verify the active stack before spending GPU time: PyTorch `2.13.0+rocm10.1...`, Triton `3.8.0`, one gfx1250 GPU, and the previously selected pinned prebuilt LLVM rather than `llvm-project-gfx1250`.
-- Create a resumable output root outside both repositories, keyed by source commit and target GPU, for example `/home/niromero/docker_workspace/paas_runs/triton-conv-priority-2d7f07e-gfx1250/`.
-- Copy [kernels/priority](/home/niromero/docker_workspace/Triton_Conv_Development/kernels/priority) into that output root while preserving the model/category hierarchy. Save a manifest containing every relative path, original SHA-256, source commit, package versions, and GPU properties.
+- Create a new resumable subset output root outside both repositories, for example `/home/niromero/docker_workspace/paas_runs/priority-representative-gfx1250/`. Do not reuse the earlier 1,037-kernel campaign output.
+- Stage only the exact paths in [priority_representative_kernel_paths.txt](kernels/priority/priority_representative_kernel_paths.txt), preserving the model/category hierarchy:
+
+```bash
+SOURCE=/home/niromero/docker_workspace/Triton_Conv_Development/kernels/priority
+LIST=/home/niromero/docker_workspace/framework_scripts/inductor/kernels/priority/priority_representative_kernel_paths.txt
+STAGED=/home/niromero/docker_workspace/paas_runs/priority-representative-gfx1250/foreign-target
+
+python -m paas.helpers.search_kernels \
+  --dir "$SOURCE" \
+  --out "$STAGED" \
+  --names "$LIST"
+```
+
+- Assert that the staged identity set exactly equals the list: 72 unique files, split 27 pointwise / 20 reduction / 25 persistent reduction. An absent path, unlisted kernel, duplicate path, or flattened filename is a hard failure.
 - Use a campaign-specific `TORCHINDUCTOR_CACHE_DIR`, set `HIP_VISIBLE_DEVICES=0` explicitly because [manager.py](/home/niromero/docker_workspace/inductor-triton-hacks/paas/tuner/simple/manager.py) otherwise exposes no tuner GPU, and disable GPU core dumps without using blanket `killall` commands.
 - Emit an hourly progress line in the tmux monitor window and `progress.log` containing the current stage/model/kernel, completed/failed/total kernels, tested/estimated configurations, total elapsed time, processing rate, and ETA. Surface the same hourly snapshot as a progress update while the campaign is actively monitored.
 
@@ -61,12 +74,9 @@ flowchart LR
 
 The captures embed gfx942 properties (`80` CUs, wave64), while this host is gfx1250 (`256` CUs, wave32). Unmodified Inductor uses the embedded `cc` as the Triton compile target, so the raw wrappers are not valid inputs on this host.
 
-- Normalize only the campaign copy: replace each embedded `DeviceProperties(...)` literal with the exact value returned by `DeviceProperties.create(torch.device('cuda', 0))`. Assert exactly one replacement per kernel, preserve all other text, and save normalized hashes plus the old/new metadata in the manifest.
-- Make the active `paas-simple-full` configuration path device-aware. The verified call chain is [manager.py](/home/niromero/docker_workspace/inductor-triton-hacks/paas/tuner/simple/manager.py) `Runner` → [compat.py](/home/niromero/docker_workspace/inductor-triton-hacks/paas/downstream/compat.py) `genConfigs()` → [kernel_oracle.py](/home/niromero/docker_workspace/inductor-triton-hacks/paas/downstream/kernel_oracle.py) `KernelOracle.validate_config()`. Although its name suggests the optional ML oracle, `KernelOracle` currently also owns the hard limits used by the primary brute-force tuner, so it is relevant here.
-  - Pass the assigned target’s warp size through `genConfigs()` into `KernelOracle.validate_config()` instead of relying on the class-wide `threads_per_warp = 64`.
-  - Pass the same warp size into `compat._check_max_grid_x()` so the ROCm total-thread filter uses gfx1250 wave32.
-  - Have `manager.Runner` obtain the assigned GPU’s properties once and supply those explicit limits; retain a deterministic default for GPU-free callers.
-  - Preserve the behaviors called out in [CHANGELOG.md](/home/niromero/docker_workspace/inductor-triton-hacks/CHANGELOG.md): pinned block axes, inclusion of the compiled launch configuration, the deliberately narrow `num_stages` sweep for fused kernels, failure containment, and restart/append semantics.
+- Use the target-portability support in the combined PAAS branch rather than a campaign-local rewrite. `paas-inductor --retarget-output-dir` must create a non-destructive target copy, replace the complete embedded `DeviceProperties(...)` object from logical GPU 0, omit stale launch sidecars, and record source/target hashes in `paas_portability_manifest.json`.
+- Require the prepared manifest and generated derivative provenance to agree with the active gfx1250/wave32 device before tuning. PAAS must pass the live wave size and thread limits through `genConfigs()` and `KernelOracle.validate_config()`; do not fall back to the captured wave64 assumptions.
+- This target-portability change intentionally does not patch PyTorch/Inductor API-version differences. Record such kernels as explicit compatibility failures rather than modifying their Triton bodies in this campaign.
 - Use the correct test layers:
   - Extend [test_paas-tuning-fixes.py](/home/niromero/docker_workspace/inductor-triton-hacks/test/test_paas-tuning-fixes.py), which directly tests `compat.genConfigs()`, `KernelOracle.validate_config()`, `_check_max_grid_x()`, compiled-config inclusion, pinning, and runner failure/restart behavior. The filename is `test_paas-tuning-fixes.py`, not `test_pass-tuning-fixes.py`.
   - Update/run [test_paas-optimizer.py](/home/niromero/docker_workspace/inductor-triton-hacks/test/test_paas-optimizer.py), the optimizer test explicitly documented by [README.md](/home/niromero/docker_workspace/inductor-triton-hacks/README.md), to cover the `paas-simple-full` wiring after device properties are added.
@@ -75,7 +85,7 @@ The captures embed gfx942 properties (`80` CUs, wave64), while this host is gfx1
 
 ## 3. Run an architecture and workflow pilot
 
-- Select representative pointwise, reduction, and persistent-reduction kernels from the copied tree.
+- Select one pointwise, one reduction, and one persistent-reduction kernel from the 72-path list for a workflow pilot; do not add pilot kernels outside the selected set.
 - For each pilot kernel, run the normalized raw harness, then `paas-inductor --run-types=autotune`, and verify that compilation targets gfx1250, execution succeeds, and an `.autotune.launch_params` sidecar is produced.
 - Generate `_tune.py` files with `paas-make-standalone --mode tune --launch-params-suffix=.autotune.launch_params`.
 - Run `paas-simple-full --just-list`, followed by the actual one-replica sweep, and require:
@@ -83,20 +93,39 @@ The captures embed gfx942 properties (`80` CUs, wave64), while this host is gfx1
   - at least one legal candidate;
   - numerical validation against the baseline (`status=ok`);
   - no gfx942 binary-load errors or missing launch metadata.
-- Use the pilot’s measured configuration rate to calculate a campaign ETA. A preliminary estimate is roughly 70 or more GPU-hours on this single GPU, but the exact candidate count will replace that estimate before the full sweep.
+- Use the pilot’s measured configuration rate and the selected kernels’ `--just-list` counts to calculate the 72-kernel ETA. Do not reuse the earlier full-corpus estimate.
 
-## 4. Capture baselines and launch parameters for all kernels
+## 4. Capture baselines and launch parameters for the subset
 
-- Run `paas-inductor` once at the copied tree root with recursive discovery, `--distributed --proc-per-gpu=1`, `--run-types=autotune`, and an isolated cache.
+- Run `paas-inductor` once on the 72-file staged tree with `--retarget-output-dir` pointing at a separate gfx1250 tree:
+
+```bash
+STAGED=/home/niromero/docker_workspace/paas_runs/priority-representative-gfx1250/foreign-target
+TARGET=/home/niromero/docker_workspace/paas_runs/priority-representative-gfx1250/kernels
+
+HIP_VISIBLE_DEVICES=0 paas-inductor \
+  --dir "$STAGED" \
+  --retarget-output-dir "$TARGET" \
+  --distributed \
+  --proc-per-gpu=1 \
+  --run-types=autotune
+```
+
 - Preserve `baseline_perf.csv`, `autotune_perf.csv`, `benchmark_failures.csv`, and every `.autotune.launch_params` sidecar.
-- Reconcile outputs against the 1,037-entry manifest. Retry failures individually with focused logs and a larger timeout where appropriate; classify persistent compile, launch, OOM, timeout, and harness failures rather than silently dropping them.
-- Do not proceed to exhaustive tuning for a kernel until its gfx1250 launch parameters are present and its baseline succeeds.
+- Reconcile outputs against the 72-entry selection and portability manifest. Retry failures individually with focused logs and a larger timeout where appropriate; classify persistent compile, launch, API-compatibility, OOM, timeout, and harness failures rather than silently dropping them.
+- Do not proceed to configuration tuning for a kernel until its gfx1250 launch parameters are present and its baseline succeeds.
 
-## 5. Generate and exhaustively tune all eligible instances
+## 5. Generate and tune all eligible selected instances
 
-- Enumerate the 46 leaf directories from the manifest. `paas-make-standalone` is one-directory-only, and `paas-simple-full` only scans the current directory, so invoke both once per leaf rather than flattening files with colliding names.
+- Enumerate only populated model/category directories under `$TARGET`. `paas-make-standalone` is one-directory-only, and `paas-simple-full` only scans the current directory, so invoke both once per populated selected leaf rather than flattening files with colliding names.
 - Generate exactly one `_tune.py` per baseline-successful kernel and run `--just-list` first to record each kernel’s legal candidate count.
 - Execute `paas-simple-full` with `PAAS_TIMING_REPLICAS=1`, as requested. Each candidate still receives PAAS’s numerical output validation; only rows with case-insensitive `status=ok` are eligible to win, and the `1000 ms` failure sentinel is never ranked.
+- Apply the combined branch’s search policy:
+  - pointwise kernels remain otherwise uncapped;
+  - reduction and persistent-reduction kernels use `max(16,384, 2 × baseline block product)`;
+  - the exact Inductor baseline is retained only when it passes active-target hard limits; a rejected baseline is never reintroduced and disables the soft cap for that kernel;
+  - the installed Triton tensor-size hard limit still applies;
+  - use `--reduction-block-product-cap=0` only for an explicitly requested uncapped comparison.
 - Do **not** run a separate second pass that arbitrarily varies `num_stages`. Preserve the current policy documented in [CHANGELOG.md](/home/niromero/docker_workspace/inductor-triton-hacks/CHANGELOG.md):
   - the default fused-kernel candidate set remains `num_stages=[1]`;
   - if Inductor's captured launch configuration used another value, that compiled value is unioned into the primary search so the baseline remains reproducible;
@@ -104,7 +133,7 @@ The captures embed gfx942 properties (`80` CUs, wave64), while this host is gfx1
   - the removed `--augment-stages` behavior is not reintroduced. Any forced body-regeneration experiment would be a separate future campaign, not part of this run.
 - Drive leaves through a checkpointed campaign runner that records pending/running/completed/failed state and writes one log per leaf. On interruption, use `--restart-from` to skip completed kernels and `--append` to retain already measured configurations within a partially completed kernel.
 - Process category leaves model-by-model. After all leaves for one model finish, print a completion summary to the live tmux terminal and `progress.log`: model name, kernels completed/failed, configurations tested, best and median measured speedup ratios, model elapsed time, total elapsed time, processing rate, and campaign ETA. Ratios remain explicitly noise-unqualified because this is a one-replica run.
-- Monitor free disk, cache growth, GPU health, and progress counts. Continue through every manifest entry; persistent per-kernel failures remain explicit coverage failures rather than aborting the rest of the campaign.
+- Monitor free disk, cache growth, GPU health, and progress counts. Continue through every one of the 72 selected identities; persistent per-kernel failures remain explicit coverage failures rather than aborting the rest of the subset.
 
 ## 6. Produce collision-safe reports and verify coverage
 
@@ -112,7 +141,7 @@ The captures embed gfx942 properties (`80` CUs, wave64), while this host is gfx1
 - Build a path-aware global aggregate keyed by `model/category/source-file`, joining against `baseline_perf.csv` by `relative_dir` and kernel name.
 - Produce:
   - `best_configs.csv` with baseline config/time, best numerically valid config/time, measured ratio, candidate counts, and status counts;
-  - `coverage.json` accounting for all 1,037 inputs at each stage;
+  - `coverage.json` accounting for all 72 selected inputs at each stage and proving that no unlisted kernel entered the campaign;
   - `campaign_summary.md` grouped by model and category;
   - `timing.json` and a timing section in `campaign_summary.md` with total end-to-end time plus setup, portability-test, pilot, baseline, generation, tuning, and reporting durations;
   - `progress.log` containing the hourly and per-model terminal reports;
